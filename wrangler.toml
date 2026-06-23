@@ -1,0 +1,12 @@
+name = "vaultphotos-proxy"
+main = "worker/index.js"
+compatibility_date = "2026-06-22"
+
+# Set these as secrets (never commit real values):
+#   npx wrangler secret put HF_TOKEN
+#   npx wrangler secret put HF_REPO    # e.g. yourname/vaultphotos
+#
+# HF_REPO may also be set as a plain var here for non-secret values, but using
+# secrets for both keeps the target repo private.
+[vars]
+# HF_REPO = "your-username/vaultphotos"
