@@ -41,6 +41,13 @@ export default {
       // Attach CORS to every real response.
       const headers = new Headers(response.headers)
       for (const [k, v] of Object.entries(CORS_HEADERS)) headers.set(k, v)
+
+      // Prevent browser caching on mutable routes
+      const mutablePaths = ['/get-salt', '/get-manifest', '/get-bundle', '/list']
+      if (mutablePaths.includes(url.pathname)) {
+        headers.set('Cache-Control', 'no-cache, no-store, must-revalidate')
+      }
+
       return new Response(response.body, {
         status: response.status,
         statusText: response.statusText,
@@ -367,7 +374,13 @@ function authHeaders(env, extra = {}) {
  * Returns the upstream response directly so the body streams without buffering.
  */
 async function hfResolve(env, path) {
-  const res = await fetch(`${HF_API}/datasets/${env.HF_REPO}/resolve/main/${path}`, {
+  // Bust cache for mutable manifest, bundle, and salt to prevent CDN/caching issues
+  const isMutable = path === 'manifest.enc' || path === 'thumbs.bundle' || path === 'salt.bin'
+  const url = isMutable
+    ? `${HF_API}/datasets/${env.HF_REPO}/resolve/main/${path}?t=${Date.now()}`
+    : `${HF_API}/datasets/${env.HF_REPO}/resolve/main/${path}`
+
+  const res = await fetch(url, {
     headers: authHeaders(env),
   })
   if (res.status === 404) {

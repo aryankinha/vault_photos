@@ -20,7 +20,7 @@ export async function loadBundle() {
   try {
     buffer = await worker.getBundle()
   } catch (error) {
-    if (error.status === 404) return createEmptyBundle()
+    if (error.status === 404) return []
     throw error
   }
 
