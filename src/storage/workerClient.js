@@ -62,9 +62,11 @@ export async function uploadSalt(bytes) {
  * @param {string} id — 16-hex file id
  * @param {Uint8Array|ArrayBuffer} bytes — encrypted blob
  * @param {((e: {loaded:number,total:number,percent:number}) => void) | undefined} onProgress
+ * @param {boolean} [commit] — whether to commit the file to HF in this request
  */
-export async function uploadFile(id, bytes, onProgress) {
-  return xhrPost(`/upload-file?id=${encodeURIComponent(id)}`, bytes, onProgress)
+export async function uploadFile(id, bytes, onProgress, commit = true) {
+  const commitParam = commit ? '' : '&commit=false'
+  return xhrPost(`/upload-file?id=${encodeURIComponent(id)}${commitParam}`, bytes, onProgress)
 }
 
 /**
@@ -111,6 +113,18 @@ export async function preauthUpload(id, size, sha256) {
  */
 export async function commitUpload(id, sha256, size, verifyUrl, verifyHeaders) {
   return postJson('/commit-upload', { id, sha256, size, verifyUrl, verifyHeaders })
+}
+
+/**
+ * Bulk commit route. Commits multiple LFS file pointers and standard files
+ * (manifest and bundle) in a single Git commit transaction.
+ * @param {object} payload
+ * @param {Array<{id:string, sha256:string, size:number}>} payload.files
+ * @param {string} [payload.manifestBytesBase64]
+ * @param {string} [payload.bundleBytesBase64]
+ */
+export async function commitBatch(payload) {
+  return postJson('/commit-batch', payload)
 }
 
 // ---------------------------------------------------------------------------

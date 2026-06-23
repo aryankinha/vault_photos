@@ -23,17 +23,12 @@ import { encryptPacked } from '../crypto/encrypt'
 import { getActiveKey } from '../crypto/keyDerivation'
 import { addEntry } from '../storage/manifest'
 import { appendThumb } from '../storage/bundle'
-import {
-  commitUpload,
-  preauthUpload,
-  uploadFile,
-} from '../storage/workerClient'
 import { readMediaMetadata } from '../utils/exif'
 import { generateThumbnail } from '../utils/thumbnail'
 import { generateMediaId } from '../utils/uuid'
-import { clearCache } from '../session/cache'
+import { clearCache, queueUpload, dequeueUpload } from '../session/cache'
 import { EtaTracker } from '../utils/eta'
-import { loadManifest, saveManifest } from '../storage/manifest'
+import { loadManifest } from '../storage/manifest'
 import { encryptPacked as encryptPackedCrypto } from '../crypto/encrypt'
 import * as worker from '../storage/workerClient'
 import {
@@ -138,27 +133,34 @@ export async function uploadMediaBatch(files, onBatchProgress) {
       const fileBytes = new Uint8Array(await file.arrayBuffer())
       const encrypted = new Uint8Array(await encryptPacked(fileBytes, getActiveKey()))
       const id = generateMediaId()
-      return { file, meta, thumbBytes, encrypted, id }
+
+      // Queue the upload in IndexedDB for Background Sync before network starts
+      const initialEntry = {
+        id,
+        name: file.name,
+        type: meta.type,
+        date_taken: meta.date_taken,
+        size: file.size,
+        duration: meta.duration,
+      }
+      await queueUpload(id, encrypted, initialEntry)
+
+      return { file, meta, thumbBytes, encrypted, id, initialEntry }
     }),
   )
 
   // ------------------------------------------------------------------
   // Step 2 — upload encrypted blobs with concurrency limit
   // ------------------------------------------------------------------
-  // Track per-file loaded bytes for overall ETA calculation.
   const totalEncryptedBytes = processedFiles.reduce((s, p) => s + p.encrypted.byteLength, 0)
   const eta = new EtaTracker(totalEncryptedBytes)
   const perFileLoaded = new Array(processedFiles.length).fill(0)
   let completedFiles = 0
 
-  // Results accumulate here; some may be errors.
+  // Accumulate the commit descriptors: { id, sha256, size }
+  const commitDescriptors = new Array(processedFiles.length).fill(null)
   const uploadResults = new Array(processedFiles.length).fill(null)
 
-  /**
-   * Emit current overall progress.
-   * @param {number} fileIndex — index of the file currently active
-   * @param {string} stage
-   */
   function emitProgress(fileIndex, stage) {
     const totalLoaded = perFileLoaded.reduce((a, b) => a + b, 0)
     eta.update(totalLoaded)
@@ -174,20 +176,40 @@ export async function uploadMediaBatch(files, onBatchProgress) {
     })
   }
 
-  /**
-   * Upload one processed file. Returns the resolved entry or throws.
-   */
   async function uploadOne(pf, index) {
     emitProgress(index, 'uploading')
-    await uploadEncryptedFile(pf.id, pf.encrypted, (e) => {
+    
+    // Call uploadEncryptedFile with commit = false to defer the Git commit
+    const uploadRes = await uploadEncryptedFile(pf.id, pf.encrypted, (e) => {
       perFileLoaded[index] = e.loaded
       emitProgress(index, 'uploading')
-    })
+    }, false)
+    
+    // Retrieve sha256 and size
+    let sha256, size
+    if (uploadRes instanceof ArrayBuffer) {
+      // Proxy upload returned raw JSON arraybuffer
+      const json = JSON.parse(new TextDecoder().decode(uploadRes))
+      sha256 = json.sha256
+      size = json.size
+    } else if (uploadRes && uploadRes.sha256) {
+      // Direct upload returned { sha256, size }
+      sha256 = uploadRes.sha256
+      size = uploadRes.size
+    } else {
+      // Fallback
+      sha256 = await computeSha256Hex(pf.encrypted)
+      size = pf.encrypted.byteLength
+    }
+    
+    commitDescriptors[index] = { id: pf.id, sha256, size }
     perFileLoaded[index] = pf.encrypted.byteLength
+    
+    // Dequeue successfully uploaded file from IndexedDB background sync queue
+    await dequeueUpload(pf.id)
   }
 
-  // Concurrency queue.
-  const queue = [...processedFiles.entries()] // [[index, pf], ...]
+  const queue = [...processedFiles.entries()]
   const inFlight = new Set()
 
   function startNext() {
@@ -215,8 +237,6 @@ export async function uploadMediaBatch(files, onBatchProgress) {
 
   await new Promise((resolve) => {
     startNext()
-    // Poll until all tasks are done. We resolve when inFlight empties and
-    // queue is empty. The startNext + finally loop drives this naturally.
     const check = setInterval(() => {
       if (inFlight.size === 0 && queue.length === 0) {
         clearInterval(check)
@@ -226,7 +246,7 @@ export async function uploadMediaBatch(files, onBatchProgress) {
   })
 
   // ------------------------------------------------------------------
-  // Step 3 — one single manifest update
+  // Step 3 — Build updated manifest and bundle locally, then commit everything bulk
   // ------------------------------------------------------------------
   report({
     totalFiles,
@@ -238,13 +258,12 @@ export async function uploadMediaBatch(files, onBatchProgress) {
     errors,
   })
 
-  // Only commit successful uploads.
-  const succeeded = processedFiles.filter((_, i) => uploadResults[i]?.ok)
+  const succeededIndices = processedFiles
+    .map((_, i) => i)
+    .filter((i) => uploadResults[i]?.ok)
 
-  if (succeeded.length > 0) {
-    // ------------------------------------------------------------------
-    // Step 4 — one single bundle update (fetch → decrypt → append all → re-encrypt → upload)
-    // ------------------------------------------------------------------
+  if (succeededIndices.length > 0) {
+    // 1. Fetch current bundle
     let rawBundleBuffer
     try {
       const encBuf = await worker.getBundle()
@@ -254,25 +273,25 @@ export async function uploadMediaBatch(files, onBatchProgress) {
       else throw e
     }
 
-    // Compute thumb offsets/lengths for all new entries at once.
+    // 2. Append thumbnails locally to get new offsets
     const thumbEntries = []
     let currentBuffer = rawBundleBuffer
-    for (const pf of succeeded) {
+    for (const idx of succeededIndices) {
+      const pf = processedFiles[idx]
       const result = appendBundleEntry(currentBuffer, { id: pf.id, bytes: pf.thumbBytes })
       thumbEntries.push({
         pf,
         thumb_offset: result.thumb_offset,
         thumb_length: result.thumb_length,
       })
-      // Update currentBuffer for the next iteration so offsets chain correctly.
       currentBuffer = result.bundle
     }
 
-    // Encrypt and upload the final bundle in one shot.
-    const encryptedBundle = await encryptPackedCrypto(currentBuffer, getActiveKey())
-    await worker.uploadBundle(encryptedBundle)
+    // 3. Encrypt bundle locally
+    const encryptedBundle = new Uint8Array(await encryptPackedCrypto(currentBuffer, getActiveKey()))
 
-    // Build manifest entries now that we have correct thumb offsets.
+    // 4. Update manifest locally
+    const manifest = await loadManifest()
     const newEntries = thumbEntries.map(({ pf, thumb_offset, thumb_length }) => ({
       id: pf.id,
       name: pf.file.name,
@@ -284,21 +303,34 @@ export async function uploadMediaBatch(files, onBatchProgress) {
       thumb_length,
     }))
 
-    // Step 3 (continued) — load manifest once, push all new entries, save once.
-    const manifest = await loadManifest()
     for (const entry of newEntries) {
       manifest.files.push(entry)
     }
     manifest.updated_at = new Date().toISOString()
-    await saveManifest(manifest)
+
+    // 5. Encrypt manifest locally
+    const manifestBytes = new TextEncoder().encode(JSON.stringify(manifest))
+    const encryptedManifest = new Uint8Array(await encryptPackedCrypto(manifestBytes, getActiveKey()))
+
+    // 6. Make ONE SINGLE Git commit on the worker to finalize the batch
+    const filesToCommitInBatch = succeededIndices.map((i) => commitDescriptors[i])
+    
+    const commitPayload = {
+      files: filesToCommitInBatch,
+      manifestBytesBase64: bytesToBase64(encryptedManifest),
+      bundleBytesBase64: bytesToBase64(encryptedBundle),
+    }
+
+    await worker.commitBatch(commitPayload)
   }
 
   // ------------------------------------------------------------------
-  // Step 5 — clearCache once
+  // Step 4 — Clear session cache
   // ------------------------------------------------------------------
   await clearCache()
 
-  return { entries: succeeded, errors }
+  const succeededFiles = succeededIndices.map((i) => processedFiles[i])
+  return { entries: succeededFiles, errors }
 }
 
 // ---------------------------------------------------------------------------
@@ -312,14 +344,15 @@ export async function uploadMediaBatch(files, onBatchProgress) {
  * @param {string} id — 16-hex file id
  * @param {Uint8Array} encryptedBytes
  * @param {(e: {loaded:number,total:number,percent:number}) => void} [onProgress]
+ * @param {boolean} [commit] — whether to commit the file pointer immediately
  */
-export async function uploadEncryptedFile(id, encryptedBytes, onProgress) {
+export async function uploadEncryptedFile(id, encryptedBytes, onProgress, commit = true) {
   if (encryptedBytes.byteLength < DIRECT_UPLOAD_THRESHOLD) {
     // Small file — proxy through the worker via XHR.
-    await uploadFile(id, encryptedBytes, onProgress)
+    return await worker.uploadFile(id, encryptedBytes, onProgress, commit)
   } else {
     // Large file — browser PUTs directly to S3; worker only authorizes + commits.
-    await uploadDirect(id, encryptedBytes, onProgress)
+    return await uploadDirect(id, encryptedBytes, onProgress, commit)
   }
 }
 
@@ -327,18 +360,22 @@ export async function uploadEncryptedFile(id, encryptedBytes, onProgress) {
  * Direct-to-S3 upload path for large encrypted files.
  * Worker negotiates LFS credentials; browser PUTs raw bytes directly to S3.
  */
-async function uploadDirect(id, encryptedBytes, onProgress) {
+async function uploadDirect(id, encryptedBytes, onProgress, commit = true) {
   const sha256 = await computeSha256Hex(encryptedBytes)
   const size = encryptedBytes.byteLength
 
-  const preauth = await preauthUpload(id, size, sha256)
+  const preauth = await worker.preauthUpload(id, size, sha256)
 
   if (!preauth.alreadyExists) {
     const { uploadUrl, uploadHeaders } = preauth
     await xhrPut(uploadUrl, uploadHeaders || {}, encryptedBytes, onProgress)
   }
 
-  await commitUpload(id, sha256, size, preauth.verifyUrl ?? null, preauth.verifyHeaders ?? null)
+  if (commit) {
+    await worker.commitUpload(id, sha256, size, preauth.verifyUrl ?? null, preauth.verifyHeaders ?? null)
+  }
+
+  return { sha256, size }
 }
 
 /**
@@ -377,4 +414,20 @@ async function computeSha256Hex(bytes) {
   return Array.from(new Uint8Array(buf))
     .map((b) => b.toString(16).padStart(2, '0'))
     .join('')
+}
+
+/**
+ * Helper to convert Uint8Array bytes to base64.
+ * @param {Uint8Array} bytes
+ * @returns {string}
+ */
+function bytesToBase64(bytes) {
+  let binary = ''
+  const len = bytes.byteLength
+  const chunkSize = 0x8000
+  for (let i = 0; i < len; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize)
+    binary += String.fromCharCode.apply(null, chunk)
+  }
+  return btoa(binary)
 }

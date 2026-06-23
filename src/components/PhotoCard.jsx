@@ -32,14 +32,28 @@ export function PhotoCard({ entry, thumbUrl, onClick }) {
         </div>
       )}
       {entry.type === 'video' && (
-        <span className="pointer-events-none absolute inset-0 flex items-center justify-center">
-          <span className="rounded-full bg-black/50 p-2 text-white backdrop-blur-sm">
-            <Play size={16} fill="currentColor" />
+        <>
+          <span className="pointer-events-none absolute inset-0 flex items-center justify-center">
+            <span className="rounded-full bg-black/50 p-2 text-white backdrop-blur-sm transition duration-200 group-hover:scale-110">
+              <Play size={16} fill="currentColor" />
+            </span>
           </span>
-        </span>
+          {entry.duration && (
+            <span className="absolute bottom-1.5 right-1.5 rounded bg-black/60 px-1.5 py-0.5 text-[9px] font-medium tabular-nums text-white backdrop-blur-sm">
+              {formatDuration(entry.duration)}
+            </span>
+          )}
+        </>
       )}
     </button>
   )
+}
+
+function formatDuration(seconds) {
+  if (!seconds || !Number.isFinite(seconds)) return ''
+  const m = Math.floor(seconds / 60)
+  const s = Math.floor(seconds % 60)
+  return `${m}:${s.toString().padStart(2, '0')}`
 }
 
 export function VideoThumb({ entry, thumbUrl, onClick }) {

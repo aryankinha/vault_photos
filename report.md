@@ -743,21 +743,32 @@ Final verification: **`npm run lint` → 0 errors**, **`npm run build` → clean
 
 ---
 
-## 12. Known limitations & V2 scope
+## 12. V2 Architecture & Core Upgrades
 
-### V1 limitations (by design)
+VaultPhotos V2 introduces major performance, stability, and UX enhancements to support parallel uploads and background operations without sacrificing client-side security.
 
-- **Single passphrase, single device.** No multi-device key sync; each device
-  must enter the passphrase to derive the same key (deterministic given salt).
-- **Upload size limit resolved.** Uploads no longer face the Cloudflare Worker 100 MB request body limit. Files >= 50 MB use the direct-to-S3 upload path where the browser uploads the encrypted payload directly to S3 storage, enabling very large photo and video vault storage.
-- **No deletion UI.** Entries can be added but V1 has no delete flow.
-- **Wrong passphrase is detected only by failed decryption** (no stored verifier
-  hash by design — that would weaken the model).
+### 12.1 Transactional Single-Commit Batch Pipeline
+To prevent Git revision conflicts (409/412 status codes) on Hugging Face when uploading multiple files concurrently:
+1. **Parallel Uploads:** The client reads metadata, generates thumbnails, and encrypts files in parallel. It uploads the raw encrypted byte streams to S3 in parallel (either directly or via the proxy with the query flag `commit=false`).
+2. **Deferred Commits:** The worker uploads files to S3 but skips Git commits. It returns the metadata (`sha256` and `size`) to the browser.
+3. **Atomic Single Commit:** At the end of the batch upload, the client sends a single payload to a new worker endpoint, `/commit-batch`. This payload contains all LFS pointers, the encrypted manifest, and the encrypted thumbnail bundle. The worker commits all files, the manifest, and the bundle to Hugging Face in a **single Git transaction**. This reduces Git operations from $N+2$ commits to exactly $1$ commit, boosting upload speeds and guaranteeing zero revision conflicts.
 
-### Explicitly deferred to V2
+### 12.2 Background Sync Queue
+To prevent data loss if a tab is closed mid-upload, the application implements a background sync queue:
+* Before any network upload starts, the client serializes the encrypted payload and manifest entry and writes it to the `uploadQueue` store in IndexedDB.
+* Upon successful upload, the item is removed (`dequeueUpload`).
+* The Service Worker ([sw.js](file:///Users/aryankinha/Documents/Aryan/Project/VaultPhotos/public/sw.js)) intercepts connection recovery and sync tags to automatically upload remaining items in the queue from the background.
 
-GPS display, albums, search, sharing, multi-device key sync, tags, favorites,
-size-padding (to hide file sizes), delete, SIMD argon2 build, batch upload progress aggregation.
+### 12.3 Real-time Progress & Screen Wake Lock
+* **EtaTracker:** Standardizes speed estimation using a 5-sample rolling time window to filter bandwidth fluctuations and display a reliable human-readable ETA.
+* **Screen Wake Lock:** Integrates the browser's Wake Lock API inside the upload context to keep the display active during bulk uploads, automatically re-acquiring the lock if the page transitions back to a visible state.
+* **Persistent Bottom Progress Bar:** Lives globally under [App.jsx](file:///Users/aryankinha/Documents/Aryan/Project/VaultPhotos/src/App.jsx)'s router, rendering progress, file count, and ETA across any client route.
+
+### 12.4 Responsive UI & Auto-Refresh Hook
+* **Auto-Refresh Gallery:** The gallery page's state hook `useGallery` monitors `UploadContext`. When a background upload completes (`isUploading` transitions to false), it triggers `reload()`, automatically rendering new items in the gallery without requiring a manual browser tab refresh (which would erase the in-RAM AES key).
+* **Category Filters:** Segmented buttons in [Gallery.jsx](file:///Users/aryankinha/Documents/Aryan/Project/VaultPhotos/src/pages/Gallery.jsx) allow client-side filtering by media type (**All**, **Photos**, and **Videos**).
+* **Duration Badges:** Video thumbnails in [PhotoCard.jsx](file:///Users/aryankinha/Documents/Aryan/Project/VaultPhotos/src/components/PhotoCard.jsx) dynamically show duration labels (e.g., `1:25`) derived from video metadata.
+* **Dynamic Topbar Links:** The shared [Topbar.jsx](file:///Users/aryankinha/Documents/Aryan/Project/VaultPhotos/src/components/Topbar.jsx) dynamically checks the URL path to present a "Gallery" navigation link on the upload page, removing the redundant upload button.
 
 ---
 
@@ -783,8 +794,7 @@ cp .env.example .env          # set VITE_WORKER_URL locally
 npm run build                 # → dist/
 ```
 
-Import into Vercel, set `VITE_WORKER_URL` as an env var, redeploy. `vercel.json`
-includes the SPA rewrite so `/view/:id` resolves on direct hit/refresh.
+Import into Vercel, set `VITE_WORKER_URL` as an env var, redeploy. `vercel.json` includes the SPA rewrite so `/view/:id` resolves on direct hit/refresh.
 
 ### Prerequisites
 

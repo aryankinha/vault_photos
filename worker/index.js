@@ -67,6 +67,7 @@ function route(path, method) {
   if (path === '/upload-file' && method === 'POST') return uploadFile
   if (path === '/preauth-upload' && method === 'POST') return preauthUpload
   if (path === '/commit-upload' && method === 'POST') return commitUpload
+  if (path === '/commit-batch' && method === 'POST') return commitBatch
   if (path === '/list' && method === 'GET') return listFiles
   return null
 }
@@ -117,12 +118,13 @@ async function uploadFile({ request, url, env }) {
   if (!id || !/^[0-9a-f]{16}$/i.test(id)) {
     return json({ error: 'Missing or invalid id query param' }, 400)
   }
+  const commit = url.searchParams.get('commit') !== 'false'
 
   const bytes = await readRawBody(request)
   const path = `files/${id}.enc`
   await ensureGitAttributes(env)
-  await hfUploadFile(env, path, bytes)
-  return json({ ok: true, id }, 200)
+  const result = await hfUploadFile(env, path, bytes, commit)
+  return json({ ok: true, id, sha256: result.oid, size: result.size }, 200)
 }
 
 /**
@@ -265,6 +267,83 @@ async function commitUpload({ request, env }) {
   return json({ ok: true }, 200)
 }
 
+async function commitBatch({ request, env }) {
+  const body = await request.json()
+  const { files, manifestBytesBase64, bundleBytesBase64 } = body
+
+  if (!Array.isArray(files)) {
+    return json({ error: 'Missing or invalid files array' }, 400)
+  }
+
+  const filesToCommit = []
+  if (manifestBytesBase64) {
+    filesToCommit.push({ path: 'manifest.enc', content: manifestBytesBase64 })
+  }
+  if (bundleBytesBase64) {
+    filesToCommit.push({ path: 'thumbs.bundle', content: bundleBytesBase64 })
+  }
+
+  const lfsFilesToCommit = []
+  for (const f of files) {
+    if (!f.id || !/^[0-9a-f]{16}$/i.test(f.id)) {
+      return json({ error: 'Invalid file id in batch' }, 400)
+    }
+    if (!f.sha256 || !/^[0-9a-f]{64}$/i.test(f.sha256)) {
+      return json({ error: 'Invalid sha256 in batch' }, 400)
+    }
+    if (!Number.isFinite(f.size) || f.size <= 0) {
+      return json({ error: 'Invalid size in batch' }, 400)
+    }
+    lfsFilesToCommit.push({
+      path: `files/${f.id}.enc`,
+      size: f.size,
+      oid: f.sha256,
+    })
+  }
+
+  await ensureGitAttributes(env)
+  await hfGitCommitBatch(
+    env,
+    `Batch upload ${lfsFilesToCommit.length} file(s)`,
+    filesToCommit,
+    lfsFilesToCommit,
+  )
+  return json({ ok: true }, 200)
+}
+
+async function hfGitCommitBatch(env, summary, filesToCommit, lfsFilesToCommit) {
+  const lines = []
+  lines.push(JSON.stringify({ key: 'header', value: { summary } }))
+
+  for (const f of filesToCommit) {
+    lines.push(
+      JSON.stringify({
+        key: 'file',
+        value: { path: f.path, content: f.content, encoding: 'base64' },
+      }),
+    )
+  }
+
+  for (const lf of lfsFilesToCommit) {
+    lines.push(
+      JSON.stringify({
+        key: 'lfsFile',
+        value: { path: lf.path, algo: 'sha256', size: lf.size, oid: lf.oid },
+      }),
+    )
+  }
+
+  const ndjson = lines.join('\n')
+
+  const res = await fetch(`${HF_API}/api/datasets/${env.HF_REPO}/commit/main`, {
+    method: 'POST',
+    headers: authHeaders(env, { 'Content-Type': 'application/x-ndjson' }),
+    body: ndjson,
+  })
+  if (!res.ok) throw await hfError(res, `commit-batch`)
+  return res.json()
+}
+
 async function listFiles({ env }) {
   const tree = await hfListTree(env, 'files')
   const ids = tree.map((entry) => entry.path.replace(/^files\//, '').replace(/\.enc$/, ''))
@@ -338,7 +417,7 @@ async function hfGitCommit(env, path, bytes, summary) {
  * under an LFS path) follow the LFS flow: preupload → batch → S3 PUT → commit
  * as lfsFile. Mirrors @huggingface/hub's commit implementation.
  */
-async function hfUploadFile(env, path, bytes) {
+async function hfUploadFile(env, path, bytes, commit = true) {
   const size = bytes.byteLength
   const sample = bytesToBase64(bytes.slice(0, 512))
 
@@ -358,8 +437,12 @@ async function hfUploadFile(env, path, bytes) {
 
   if (uploadMode !== 'lfs') {
     // Regular git blob.
-    await hfGitCommit(env, path, bytes, `Add ${path}`)
-    return
+    if (commit) {
+      await hfGitCommit(env, path, bytes, `Add ${path}`)
+    } else {
+      throw new Error(`Cannot upload Git file without committing: ${path}`)
+    }
+    return { oid: await sha256Hex(bytes), size }
   }
 
   // LFS flow.
@@ -409,23 +492,27 @@ async function hfUploadFile(env, path, bytes) {
   }
 
   // Commit the LFS pointer.
-  const ndjson = [
-    JSON.stringify({ key: 'header', value: { summary: `Add ${path}` } }),
-    JSON.stringify({
-      key: 'lfsFile',
-      value: { path, algo: 'sha256', size, oid },
-    }),
-  ].join('\n')
+  if (commit) {
+    const ndjson = [
+      JSON.stringify({ key: 'header', value: { summary: `Add ${path}` } }),
+      JSON.stringify({
+        key: 'lfsFile',
+        value: { path, algo: 'sha256', size, oid },
+      }),
+    ].join('\n')
 
-  const commitRes = await fetch(
-    `${HF_API}/api/datasets/${env.HF_REPO}/commit/main`,
-    {
-      method: 'POST',
-      headers: authHeaders(env, { 'Content-Type': 'application/x-ndjson' }),
-      body: ndjson,
-    },
-  )
-  if (!commitRes.ok) throw await hfError(commitRes, `commit lfs ${path}`)
+    const commitRes = await fetch(
+      `${HF_API}/api/datasets/${env.HF_REPO}/commit/main`,
+      {
+        method: 'POST',
+        headers: authHeaders(env, { 'Content-Type': 'application/x-ndjson' }),
+        body: ndjson,
+      },
+    )
+    if (!commitRes.ok) throw await hfError(commitRes, `commit lfs ${path}`)
+  }
+
+  return { oid, size }
 }
 
 /**
