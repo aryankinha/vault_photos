@@ -1,10 +1,13 @@
 /**
- * Thin fetch wrapper for the Cloudflare Worker. This is the only module in the
- * app that knows how to talk to the network — no HF URLs live anywhere else.
+ * Thin fetch/XHR wrapper for the Cloudflare Worker. This is the only module in
+ * the app that knows how to talk to the network — no HF URLs live anywhere else.
  *
- * All binary moves as raw `application/octet-stream`, not base64. Uploads send
- * ArrayBuffer/Uint8Array bodies; downloads return ArrayBuffer. JSON helpers are
- * provided for the few JSON routes.
+ * Binary downloads use fetch (GET, no progress needed). Binary uploads that
+ * benefit from per-byte progress use XMLHttpRequest so we can wire
+ * xhr.upload.onprogress. The optional `onProgress` callback receives:
+ *   { loaded: number, total: number, percent: number }
+ *
+ * JSON routes (preauth/commit) use fetch with JSON bodies.
  */
 
 const WORKER_URL = import.meta.env.VITE_WORKER_URL
@@ -16,61 +19,98 @@ if (!WORKER_URL) {
   )
 }
 
+// ---------------------------------------------------------------------------
+// Public API — GET routes (unchanged signatures)
+// ---------------------------------------------------------------------------
+
 export async function getSalt() {
   return getBytes('/get-salt')
-}
-
-export async function uploadSalt(bytes) {
-  return postBytes('/upload-salt', bytes)
 }
 
 export async function getManifest() {
   return getBytes('/get-manifest')
 }
 
-export async function uploadManifest(bytes) {
-  return postBytes('/upload-manifest', bytes)
-}
-
 export async function getBundle() {
   return getBytes('/get-bundle')
-}
-
-export async function uploadBundle(bytes) {
-  return postBytes('/upload-bundle', bytes)
 }
 
 export async function getFile(id) {
   return getBytes(`/get-file/${id}`)
 }
 
-export async function uploadFile(id, bytes) {
-  return postBytes(`/upload-file?id=${encodeURIComponent(id)}`, bytes)
+export async function listIds() {
+  const res = await fetch(`${WORKER_URL}/list`)
+  if (!res.ok) throw await httpError(res, 'list')
+  return res.json()
+}
+
+// ---------------------------------------------------------------------------
+// Public API — small POST routes (no progress needed, use fetch)
+// ---------------------------------------------------------------------------
+
+export async function uploadSalt(bytes) {
+  return xhrPost('/upload-salt', bytes)
+}
+
+// ---------------------------------------------------------------------------
+// Public API — binary upload routes with optional XHR progress
+// ---------------------------------------------------------------------------
+
+/**
+ * Upload an encrypted media file to the worker proxy.
+ * @param {string} id — 16-hex file id
+ * @param {Uint8Array|ArrayBuffer} bytes — encrypted blob
+ * @param {((e: {loaded:number,total:number,percent:number}) => void) | undefined} onProgress
+ */
+export async function uploadFile(id, bytes, onProgress) {
+  return xhrPost(`/upload-file?id=${encodeURIComponent(id)}`, bytes, onProgress)
 }
 
 /**
- * Direct-to-S3 path, step 1. Ask the worker to negotiate LFS credentials for a
- * large file. The browser passes its precomputed sha256 + size; the worker
- * replies with an S3 upload URL (or `{ alreadyExists: true }` if S3 already has
- * that sha256). No file bytes cross this call.
+ * Upload the encrypted manifest blob.
+ * @param {Uint8Array|ArrayBuffer} bytes
+ * @param {((e: {loaded:number,total:number,percent:number}) => void) | undefined} onProgress
+ */
+export async function uploadManifest(bytes, onProgress) {
+  return xhrPost('/upload-manifest', bytes, onProgress)
+}
+
+/**
+ * Upload the encrypted thumbnail bundle.
+ * @param {Uint8Array|ArrayBuffer} bytes
+ * @param {((e: {loaded:number,total:number,percent:number}) => void) | undefined} onProgress
+ */
+export async function uploadBundle(bytes, onProgress) {
+  return xhrPost('/upload-bundle', bytes, onProgress)
+}
+
+// ---------------------------------------------------------------------------
+// Public API — direct-to-S3 JSON handshake (preauthUpload / commitUpload)
+// These already existed in V1.5 — signatures unchanged.
+// ---------------------------------------------------------------------------
+
+/**
+ * Direct-to-S3 step 1. Ask the worker to negotiate LFS credentials.
+ * @param {string} id
+ * @param {number} size — encrypted byte length
+ * @param {string} sha256 — hex SHA-256 of encrypted bytes
+ * @returns {{ uploadUrl: string, verifyUrl: string|null, uploadHeaders: object } | { alreadyExists: true }}
  */
 export async function preauthUpload(id, size, sha256) {
   return postJson('/preauth-upload', { id, size, sha256 })
 }
 
 /**
- * Direct-to-S3 path, step 2. After the browser PUTs the bytes to S3, ask the
- * worker to run the optional LFS verify and commit the LFS pointer.
- * `verifyUrl` may be null/absent (some batch responses omit verify).
+ * Direct-to-S3 step 2. Commit the LFS pointer after the browser PUTs to S3.
+ * @param {string} id
+ * @param {string} sha256
+ * @param {number} size
+ * @param {string|null} verifyUrl
+ * @param {object|null} verifyHeaders
  */
 export async function commitUpload(id, sha256, size, verifyUrl, verifyHeaders) {
   return postJson('/commit-upload', { id, sha256, size, verifyUrl, verifyHeaders })
-}
-
-export async function listIds() {
-  const res = await fetch(`${WORKER_URL}/list`)
-  if (!res.ok) throw await httpError(res, 'list')
-  return res.json()
 }
 
 // ---------------------------------------------------------------------------
@@ -83,15 +123,51 @@ async function getBytes(path) {
   return res.arrayBuffer()
 }
 
-async function postBytes(path, bytes) {
+/**
+ * XHR POST with raw octet-stream body and optional upload progress.
+ * Returns the response body as ArrayBuffer (for callers that don't need it,
+ * this is fine — same shape as the old postBytes helper returned Response).
+ */
+function xhrPost(path, bytes, onProgress) {
   const body = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)
-  const res = await fetch(`${WORKER_URL}${path}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/octet-stream' },
-    body,
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', `${WORKER_URL}${path}`)
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream')
+    xhr.responseType = 'arraybuffer'
+
+    if (onProgress) {
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) {
+          onProgress({ loaded: e.loaded, total: e.total, percent: e.loaded / e.total })
+        }
+      }
+    }
+
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(xhr.response)
+      } else {
+        // Try to parse JSON error body.
+        let message = `POST ${path} failed (${xhr.status})`
+        try {
+          const body = JSON.parse(new TextDecoder().decode(xhr.response))
+          if (body && body.error) message = body.error
+        } catch { /* ignore */ }
+        const err = new Error(message)
+        err.status = xhr.status
+        reject(err)
+      }
+    }
+
+    xhr.onerror = () => {
+      const err = new Error(`POST ${path} network error`)
+      err.status = 0
+      reject(err)
+    }
+
+    xhr.send(body)
   })
-  if (!res.ok) throw await httpError(res, `POST ${path}`)
-  return res
 }
 
 /**

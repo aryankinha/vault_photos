@@ -1,16 +1,25 @@
+/**
+ * Upload page — V2.
+ *
+ * The page is now a thin trigger. It hands files to UploadContext.startBatch()
+ * and shows a lightweight confirmation. All progress tracking lives in
+ * PersistentUploadBar (visible on every route). The user can navigate away
+ * immediately after tapping "Upload" — the bottom bar keeps them informed.
+ *
+ * UploadProgress.jsx is kept in the codebase but is no longer used here.
+ */
 import { useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { UploadCloud, Plus } from 'lucide-react'
+import { UploadCloud, CheckCircle2, ArrowRight } from 'lucide-react'
 import { Topbar } from '../components/Topbar'
-import { UploadProgress } from '../components/UploadProgress'
-import { useUpload } from '../hooks/useUpload'
+import { useUploadContext } from '../context/useUploadContext'
 
 export function Upload() {
   const navigate = useNavigate()
   const inputRef = useRef(null)
-  const [queue, setQueue] = useState([]) // [{ id, file, status, error }]
-  const { upload, STATUS } = useUpload()
-  const [doneCount, setDoneCount] = useState(0)
+  const { startBatch, isUploading } = useUploadContext()
+  const [started, setStarted] = useState(false)
+  const [fileCount, setFileCount] = useState(0)
 
   async function handleFiles(fileList) {
     const files = Array.from(fileList).filter(
@@ -18,61 +27,94 @@ export function Upload() {
     )
     if (files.length === 0) return
 
-    const pending = files.map((file) => ({
-      id: `${file.name}-${file.size}-${file.lastModified}`,
-      file,
-      status: STATUS.IDLE,
-      error: null,
-    }))
-    setQueue((prev) => [...pending, ...prev])
+    setFileCount(files.length)
+    setStarted(true)
 
-    for (const item of pending) {
-      setQueue((prev) =>
-        prev.map((q) =>
-          q.id === item.id ? { ...q, status: STATUS.READING, error: null } : q,
-        ),
-      )
-      try {
-        await upload(item.file)
-        setDoneCount((c) => c + 1)
-        setQueue((prev) =>
-          prev.map((q) => (q.id === item.id ? { ...q, status: STATUS.DONE } : q)),
-        )
-      } catch (e) {
-        setQueue((prev) =>
-          prev.map((q) =>
-            q.id === item.id ? { ...q, status: STATUS.ERROR, error: e } : q,
-          ),
-        )
-      }
-    }
+    // Hand off to context — this returns immediately; upload runs in background.
+    startBatch(files)
   }
-
-  function finish() {
-    navigate('/gallery')
-  }
-
-  const allDone =
-    queue.length > 0 && queue.every((q) => q.status === STATUS.DONE)
 
   return (
-    <div className="min-h-screen bg-neutral-950">
+    <div className="min-h-screen bg-neutral-950 pb-24">
       <Topbar title="Upload" />
       <main className="mx-auto max-w-2xl px-4 py-6">
-        <button
-          type="button"
-          onClick={() => inputRef.current?.click()}
-          className="flex w-full flex-col items-center justify-center gap-2 rounded-2xl border border-dashed border-white/15 bg-neutral-900/40 py-12 text-neutral-400 transition hover:border-white/25 hover:bg-neutral-900/70"
-        >
-          <UploadCloud size={26} />
-          <span className="text-sm font-medium text-neutral-200">
-            Choose photos or videos
-          </span>
-          <span className="text-xs text-neutral-500">
-            Files are encrypted on this device before upload.
-          </span>
-        </button>
 
+        {!started ? (
+          /* — Pick files — */
+          <>
+            <button
+              id="upload-drop-zone"
+              type="button"
+              onClick={() => inputRef.current?.click()}
+              disabled={isUploading}
+              className="flex w-full flex-col items-center justify-center gap-2 rounded-2xl border border-dashed border-white/15 bg-neutral-900/40 py-16 text-neutral-400 transition hover:border-white/25 hover:bg-neutral-900/70 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <UploadCloud size={28} />
+              <span className="text-sm font-medium text-neutral-200">
+                {isUploading ? 'Upload in progress…' : 'Choose photos or videos'}
+              </span>
+              <span className="text-xs text-neutral-500">
+                Files are encrypted on this device before upload.
+              </span>
+            </button>
+
+            <input
+              ref={inputRef}
+              id="upload-file-input"
+              type="file"
+              accept="image/*,video/*"
+              multiple
+              className="hidden"
+              onChange={(e) => {
+                handleFiles(e.target.files)
+                e.target.value = ''
+              }}
+            />
+          </>
+        ) : (
+          /* — Upload started confirmation — */
+          <div className="flex flex-col items-center gap-5 py-16 text-center">
+            <span className="flex h-14 w-14 items-center justify-center rounded-2xl bg-sky-500/10 text-sky-400 ring-1 ring-sky-500/20">
+              <CheckCircle2 size={28} />
+            </span>
+            <div>
+              <p className="text-sm font-semibold text-neutral-100">
+                Upload started
+              </p>
+              <p className="mt-1 text-xs text-neutral-500">
+                {fileCount} {fileCount === 1 ? 'file' : 'files'} — encrypting and uploading in the
+                background. You can navigate anywhere; the progress bar at the bottom keeps you
+                updated.
+              </p>
+            </div>
+
+            <button
+              id="upload-go-gallery-btn"
+              type="button"
+              onClick={() => navigate('/gallery')}
+              className="inline-flex items-center gap-2 rounded-lg bg-sky-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-sky-400"
+            >
+              Go to gallery <ArrowRight size={15} />
+            </button>
+
+            {/* Let the user add more files even while uploading */}
+            <button
+              id="upload-add-more-btn"
+              type="button"
+              onClick={() => {
+                setStarted(false)
+                setTimeout(() => inputRef.current?.click(), 50)
+              }}
+              className="text-xs text-neutral-500 hover:text-neutral-300 transition"
+            >
+              Add more files
+            </button>
+          </div>
+        )}
+      </main>
+
+      {/* Hidden input re-used for "add more" */}
+      {started && (
         <input
           ref={inputRef}
           type="file"
@@ -84,43 +126,7 @@ export function Upload() {
             e.target.value = ''
           }}
         />
-
-        {queue.length > 0 && (
-          <div className="mt-6 space-y-3">
-            <div className="flex items-center justify-between px-1">
-              <h3 className="text-xs font-semibold uppercase tracking-wide text-neutral-400">
-                {doneCount} of {queue.length} done
-              </h3>
-              <button
-                type="button"
-                onClick={() => inputRef.current?.click()}
-                className="inline-flex items-center gap-1 text-xs font-medium text-sky-400 hover:text-sky-300"
-              >
-                <Plus size={13} /> Add more
-              </button>
-            </div>
-
-            {queue.map((item) => (
-              <UploadProgress
-                key={item.id}
-                status={item.status}
-                fileName={item.file.name}
-                error={item.error}
-              />
-            ))}
-
-            {allDone && (
-              <button
-                type="button"
-                onClick={finish}
-                className="w-full rounded-lg bg-sky-500 px-3 py-2 text-sm font-semibold text-white transition hover:bg-sky-400"
-              >
-                Done — view gallery
-              </button>
-            )}
-          </div>
-        )}
-      </main>
+      )}
     </div>
   )
 }
