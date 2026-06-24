@@ -88,6 +88,59 @@ export async function uploadBundle(bytes, onProgress) {
 }
 
 // ---------------------------------------------------------------------------
+// V3 — Paginated bundle routes (added alongside existing bundle functions)
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch a single paginated bundle page by index.
+ * Returns the raw encrypted bytes of thumbs_page_N.bundle.
+ * Throws with error.status === 404 if the page does not exist yet.
+ *
+ * @param {number} pageIndex — zero-based integer
+ * @returns {Promise<ArrayBuffer>}
+ */
+export async function getBundlePage(pageIndex) {
+  return getBytes(`/get-bundle-page/${pageIndex}`)
+}
+
+/**
+ * Upload an encrypted bundle page.
+ * @param {number} pageIndex — zero-based integer
+ * @param {Uint8Array|ArrayBuffer} bytes — encrypted page bytes
+ * @param {((e: {loaded:number,total:number,percent:number}) => void) | undefined} onProgress
+ * @returns {Promise<ArrayBuffer>} — response body (JSON with ok:true)
+ */
+export async function uploadBundlePage(pageIndex, bytes, onProgress) {
+  return xhrPost(`/upload-bundle-page/${pageIndex}`, bytes, onProgress)
+}
+
+// ---------------------------------------------------------------------------
+// V3 — Chunked file routes (Feature 5)
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch a single encrypted chunk of a chunked media file.
+ * @param {string} id — 16-hex file id
+ * @param {number} index — zero-based chunk index
+ * @returns {Promise<ArrayBuffer>}
+ */
+export async function getChunk(id, index) {
+  return getBytes(`/get-chunk/${id}/${index}`)
+}
+
+/**
+ * Upload a single encrypted chunk of a chunked media file.
+ * @param {string} id — 16-hex file id
+ * @param {number} index — zero-based chunk index
+ * @param {Uint8Array|ArrayBuffer} bytes — encrypted chunk bytes
+ * @param {((e: {loaded:number,total:number,percent:number}) => void) | undefined} onProgress
+ * @returns {Promise<ArrayBuffer>}
+ */
+export async function uploadChunk(id, index, bytes, onProgress) {
+  return xhrPost(`/upload-chunk?id=${encodeURIComponent(id)}&index=${index}`, bytes, onProgress)
+}
+
+// ---------------------------------------------------------------------------
 // Public API — direct-to-S3 JSON handshake (preauthUpload / commitUpload)
 // These already existed in V1.5 — signatures unchanged.
 // ---------------------------------------------------------------------------

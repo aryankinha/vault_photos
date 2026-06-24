@@ -1,5 +1,24 @@
 export const MANIFEST_VERSION = 1
 
+/**
+ * Create an empty manifest.
+ *
+ * Root shape (V3 adds optional bundle_pages):
+ * {
+ *   version: 1,
+ *   created_at: ISO string,
+ *   updated_at: ISO string,
+ *   bundle_pages: number,   // total bundle pages; absent on V1/V2 → treated as 1
+ *   files: MediaEntry[]
+ * }
+ *
+ * MediaEntry optional fields added in V3 (all backward-compatible — undefined = old entry):
+ *   page_index:   number   — which bundle page this entry's thumbnail lives in
+ *                            undefined → treated as page 0 (legacy thumbs.bundle)
+ *   chunked:      boolean  — true if the file was encrypted in chunks (Feature 5)
+ *   chunk_size:   number   — bytes per chunk before encryption
+ *   chunk_count:  number   — total number of chunks
+ */
 export function createEmptyManifest(now = new Date().toISOString()) {
   return {
     version: MANIFEST_VERSION,
@@ -35,6 +54,13 @@ export function validateManifest(manifest) {
 
   if (!Array.isArray(manifest.files)) {
     throw new Error('Manifest files must be an array')
+  }
+
+  // bundle_pages is optional — must be a positive integer if present.
+  if (manifest.bundle_pages !== undefined) {
+    if (!Number.isInteger(manifest.bundle_pages) || manifest.bundle_pages < 1) {
+      throw new Error('Manifest bundle_pages must be a positive integer')
+    }
   }
 
   manifest.files.forEach(validateMediaEntry)
@@ -77,6 +103,32 @@ export function validateMediaEntry(entry) {
       throw new Error(`Media entry ${field} must be a non-negative integer`)
     }
   }
+
+  // ---------------------------------------------------------------------------
+  // V3 optional fields — validated only when present; undefined = old V1/V2 entry
+  // ---------------------------------------------------------------------------
+
+  // page_index: which bundle page this thumbnail lives in (default 0 = legacy page)
+  if (entry.page_index !== undefined) {
+    if (!Number.isInteger(entry.page_index) || entry.page_index < 0) {
+      throw new Error('Media entry page_index must be a non-negative integer')
+    }
+  }
+
+  // chunked: true when the file was encrypted in chunks (Feature 5)
+  if (entry.chunked !== undefined && typeof entry.chunked !== 'boolean') {
+    throw new Error('Media entry chunked must be a boolean')
+  }
+
+  // chunk_size / chunk_count: only required when chunked === true
+  if (entry.chunked === true) {
+    if (!Number.isInteger(entry.chunk_size) || entry.chunk_size <= 0) {
+      throw new Error('Chunked media entry must have a valid chunk_size')
+    }
+    if (!Number.isInteger(entry.chunk_count) || entry.chunk_count <= 0) {
+      throw new Error('Chunked media entry must have a valid chunk_count')
+    }
+  }
 }
 
 function isIsoString(value) {
@@ -84,3 +136,4 @@ function isIsoString(value) {
   const time = Date.parse(value)
   return Number.isFinite(time) && new Date(time).toISOString() === value
 }
+

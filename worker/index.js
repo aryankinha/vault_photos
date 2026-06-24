@@ -43,8 +43,13 @@ export default {
       for (const [k, v] of Object.entries(CORS_HEADERS)) headers.set(k, v)
 
       // Prevent browser caching on mutable routes
-      const mutablePaths = ['/get-salt', '/get-manifest', '/get-bundle', '/list']
-      if (mutablePaths.includes(url.pathname)) {
+      const mutablePaths = [
+        '/get-salt', '/get-manifest', '/get-bundle', '/list',
+        // V3 bundle pages are also mutable — bust cache on every read.
+        '/get-bundle-page',
+      ]
+      const isMutable = mutablePaths.some((p) => url.pathname === p || url.pathname.startsWith(p + '/'))
+      if (isMutable) {
         headers.set('Cache-Control', 'no-cache, no-store, must-revalidate')
       }
 
@@ -76,6 +81,15 @@ function route(path, method) {
   if (path === '/commit-upload' && method === 'POST') return commitUpload
   if (path === '/commit-batch' && method === 'POST') return commitBatch
   if (path === '/list' && method === 'GET') return listFiles
+  // V3 — paginated bundle pages
+  const bundlePageGetMatch = path.match(/^\/get-bundle-page\/(\d+)$/)
+  if (bundlePageGetMatch && method === 'GET') return (ctx) => getBundlePage(ctx, Number(bundlePageGetMatch[1]))
+  const bundlePagePostMatch = path.match(/^\/upload-bundle-page\/(\d+)$/)
+  if (bundlePagePostMatch && method === 'POST') return (ctx) => uploadBundlePage(ctx, Number(bundlePagePostMatch[1]))
+  // V3 — chunked file transfers
+  const chunkGetMatch = path.match(/^\/get-chunk\/([0-9a-f]{16})\/(\d+)$/i)
+  if (chunkGetMatch && method === 'GET') return (ctx) => getChunkHandler(ctx, chunkGetMatch[1], Number(chunkGetMatch[2]))
+  if (path === '/upload-chunk' && method === 'POST') return uploadChunkHandler
   return null
 }
 
@@ -355,6 +369,72 @@ async function listFiles({ env }) {
   const tree = await hfListTree(env, 'files')
   const ids = tree.map((entry) => entry.path.replace(/^files\//, '').replace(/\.enc$/, ''))
   return json(ids, 200)
+}
+
+// ---------------------------------------------------------------------------
+// V3 Route handlers — paginated bundle pages
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /get-bundle-page/:pageIndex
+ * Resolves thumbs_page_N.bundle from HF and streams the raw bytes back.
+ * Returns 404 if the page has not been created yet (the client treats this
+ * as an empty page — valid for galleries still using the legacy single-bundle).
+ */
+async function getBundlePage({ env }, pageIndex) {
+  const filename = `thumbs_page_${pageIndex}.bundle`
+  return hfResolve(env, filename)
+}
+
+/**
+ * POST /upload-bundle-page/:pageIndex
+ * Uploads encrypted bundle page bytes to HF as thumbs_page_N.bundle.
+ */
+async function uploadBundlePage({ request, env }, pageIndex) {
+  const bytes = await readRawBody(request)
+  await ensureGitAttributes(env)
+  const filename = `thumbs_page_${pageIndex}.bundle`
+  await hfGitCommit(env, filename, bytes, `Update bundle page ${pageIndex}`)
+  return json({ ok: true }, 200)
+}
+
+// ---------------------------------------------------------------------------
+// V3 Route handlers — chunked file encryption (Feature 5)
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /get-chunk/:id/:index
+ * Resolves files/<id>_chunk_<index>.enc from HF.
+ * Chunks are stored under files/ so .gitattributes routes them to LFS automatically.
+ */
+async function getChunkHandler({ env }, id, index) {
+  if (!id || !/^[0-9a-f]{16}$/i.test(id)) {
+    return json({ error: 'Missing or invalid file id' }, 400)
+  }
+  return hfResolve(env, `files/${id}_chunk_${index}.enc`)
+}
+
+/**
+ * POST /upload-chunk?id=...&index=...
+ * Uploads a single encrypted chunk. Follows the same LFS path as /upload-file
+ * so large chunks (e.g. 32 MB) are handled correctly.
+ */
+async function uploadChunkHandler({ request, url, env }) {
+  const id = url.searchParams.get('id')
+  const indexStr = url.searchParams.get('index')
+  if (!id || !/^[0-9a-f]{16}$/i.test(id)) {
+    return json({ error: 'Missing or invalid id query param' }, 400)
+  }
+  const index = Number(indexStr)
+  if (!Number.isInteger(index) || index < 0) {
+    return json({ error: 'Missing or invalid index query param' }, 400)
+  }
+
+  const bytes = await readRawBody(request)
+  const path = `files/${id}_chunk_${index}.enc`
+  await ensureGitAttributes(env)
+  const result = await hfUploadFile(env, path, bytes, true)
+  return json({ ok: true, id, index, sha256: result.oid, size: result.size }, 200)
 }
 
 // ---------------------------------------------------------------------------
