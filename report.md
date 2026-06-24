@@ -24,7 +24,7 @@ workflows with sequence diagrams.
 9. [Hugging Face wire format](#9-hugging-face-wire-format)
 10. [Workflows & Sequence Diagrams](#10-workflows--sequence-diagrams)
 11. [Build Order (how it was constructed)](#11-build-order)
-12. [Known limitations & V2 scope](#12-known-limitations--v2-scope)
+12. [V2 Architecture & Core Upgrades](#12-v2-architecture--core-upgrades)
 13. [Deployment](#13-deployment)
 
 ---
@@ -150,11 +150,17 @@ vaultphotos/
 ├── public/
 │   ├── manifest.json              PWA manifest
 │   ├── favicon.svg                app icon (also used by PWA)
-│   └── icons.svg
+│   ├── icons.svg
+│   └── sw.js                      Service worker for Background Sync (retry uploads)
 ├── src/
 │   ├── main.jsx                   React root
-│   ├── App.jsx                    router + <RequireUnlock> guard
+│   ├── App.jsx                    router + <RequireUnlock> guard + UploadProvider
 │   ├── index.css                  Tailwind entry
+│   │
+│   ├── context/                   global upload state context (react-refresh split)
+│   │   ├── uploadContextValue.js  raw context object
+│   │   ├── UploadContext.jsx      UploadProvider component
+│   │   └── useUploadContext.js    useUploadContext hook
 │   │
 │   ├── schema/                    (no internal imports)
 │   │   ├── manifestSchema.js      Manifest + MediaEntry shape, version const
@@ -169,41 +175,44 @@ vaultphotos/
 │   │   ├── uuid.js                16-hex-char id via crypto.getRandomValues
 │   │   ├── exif.js                date_taken / type / duration via exifr + <video>
 │   │   ├── thumbnail.js           canvas → JPEG (≤400px, q=0.7), video first frame
-│   │   └── dateGroup.js           group entries by month for the gallery
+│   │   ├── dateGroup.js           group entries by month for the gallery
+│   │   ├── eta.js                 rolling-window ETA Tracker
+│   │   └── wakeLock.js            Screen Wake Lock helper
 │   │
 │   ├── storage/                   imports crypto, schema, workerClient
-│   │   ├── workerClient.js        all fetch() to the worker (raw binary)
+│   │   ├── workerClient.js        all fetch()/XHR to the worker (raw binary)
 │   │   ├── manifest.js            load/save/addEntry round-trips
 │   │   └── bundle.js              load/appendThumb/loadThumbMap round-trips
 │   │
 │   ├── services/                  imports storage, utils, schema, session
 │   │   ├── galleryService.js      load manifest+bundle (cache or net), sort, return
-│   │   ├── uploadService.js       the full upload pipeline (read→encrypt→upload)
+│   │   ├── uploadService.js       the full upload pipeline (read→encrypt→upload/commit)
 │   │   └── viewerService.js       fetch+decrypt one file → object URL
 │   │
 │   ├── session/                   (no internal imports)
-│   │   └── cache.js               IndexedDB (idb) — decrypted bytes only, never key
+│   │   └── cache.js               IndexedDB (idb) — decrypted bytes cache & uploadQueue
 │   │
 │   ├── hooks/                     import services only
 │   │   ├── useGallery.js          { entries, thumbs, loading, error, reload }
-│   │   ├── useUpload.js           { upload, status, error, reset, STATUS }
+│   │   ├── useUpload.js           { upload, status, error, reset, STATUS } (legacy)
 │   │   └── useViewer.js           { objectUrl, loading, error }
 │   │
 │   ├── pages/                     import hooks only
 │   │   ├── Unlock.jsx             passphrase; auto-detects first-run → Create mode
-│   │   ├── Gallery.jsx            date-grouped thumbnail grid
+│   │   ├── Gallery.jsx            date-grouped thumbnail grid w/ filter tabs
 │   │   ├── Viewer.jsx             full-res image / video player
-│   │   └── Upload.jsx             file picker + per-file progress
+│   │   └── Upload.jsx             file picker + background batch triggers
 │   │
 │   └── components/
-│       ├── Topbar.jsx             Lock + Upload buttons
+│       ├── Topbar.jsx             Lock + dynamic Upload/Gallery navigation buttons
 │       ├── PhotoGrid.jsx          builds + revokes object URLs safely
-│       ├── PhotoCard.jsx          thumbnail tile (image or video w/ play icon)
+│       ├── PhotoCard.jsx          thumbnail tile (image/video w/ play icon & duration)
 │       ├── DateGroup.jsx          month header section
-│       └── UploadProgress.jsx     reading→encrypting→uploading→saving step list, with real-time progress
+│       ├── PersistentUploadBar.jsx fixed bottom progress bar (ETA + count)
+│       └── UploadProgress.jsx     legacy upload list component
 │
 ├── worker/
-│   └── index.js                   Cloudflare Worker (11 routes, HF git/LFS, direct-to-S3)
+│   └── index.js                   Cloudflare Worker (12 routes, hfGitCommitBatch, cache-busting)
 │
 ├── wrangler.toml                  CF Worker config (HF_TOKEN/HF_REPO as secrets)
 ├── vercel.json                    SPA rewrite + asset caching
@@ -360,15 +369,16 @@ keeps large video uploads under the CF Worker body cap. Each function returns
 ```js
 const WORKER_URL = import.meta.env.VITE_WORKER_URL
 export const getSalt        = () => getBytes('/get-salt')
-export const uploadSalt     = (b) => postBytes('/upload-salt', b)
+export const uploadSalt     = (b) => xhrPost('/upload-salt', b)
 export const getManifest    = () => getBytes('/get-manifest')
-export const uploadManifest = (b) => postBytes('/upload-manifest', b)
+export const uploadManifest = (b) => xhrPost('/upload-manifest', b)
 export const getBundle      = () => getBytes('/get-bundle')
-export const uploadBundle   = (b) => postBytes('/upload-bundle', b)
+export const uploadBundle   = (b) => xhrPost('/upload-bundle', b)
 export const getFile        = (id) => getBytes(`/get-file/${id}`)
-export const uploadFile     = (id, b) => postBytes(`/upload-file?id=${encodeURIComponent(id)}`, b)
+export const uploadFile     = (id, b, onProgress, commit = true) => xhrPost(`/upload-file?id=${encodeURIComponent(id)}${commit ? '' : '&commit=false'}`, b, onProgress)
 export const preauthUpload  = (id, size, sha256) => postJson('/preauth-upload', { id, size, sha256 })
 export const commitUpload   = (id, sha256, size, verifyUrl, verifyHeaders) => postJson('/commit-upload', { id, sha256, size, verifyUrl, verifyHeaders })
+export const commitBatch    = (payload) => postJson('/commit-batch', payload)
 export const listIds        = () => fetch(`${WORKER_URL}/list`).then(r => r.json())
 ```
 
@@ -384,9 +394,9 @@ and uploads.
 
 ### 7.7 `session/cache.js`
 
-IndexedDB via `idb`, one store `kv` with keys `manifest` and `bundle`. Stores
-**decrypted raw bytes only** — never the key. `clearCache()` is called on lock
-and after every upload (write-invalidation).
+IndexedDB via `idb`, featuring two stores:
+1. `kv` — stores keys `manifest` and `bundle` containing **decrypted raw bytes only** (never the key). `clearCache()` is called on lock and after every upload (write-invalidation).
+2. `uploadQueue` — stores pending uploads as `{ id, encryptedBytes, entry }` objects, allowing the Service Worker to recover and retry uploads from the background if the user closes the tab mid-upload. Employs `queueUpload(id, bytes, entry)` and `dequeueUpload(id)`.
 
 ### 7.8 `services/`
 
@@ -427,24 +437,25 @@ the key is RAM-only, a page refresh always lands the user back on Unlock.
 
 ## 8. The Cloudflare Worker
 
-`worker/index.js` — a single default-export module with a `fetch` handler. Eleven
+`worker/index.js` — a single default-export module with a `fetch` handler. Twelve
 routes, fully stateless, CORS-open (`*`), handles OPTIONS preflight.
 
 ### Routes
 
 | Route | Method | Body/Return | What it does |
 |---|---|---|---|
-| `/get-salt` | GET | → raw bytes | resolve `salt.bin` (404 if missing = first run) |
+| `/get-salt` | GET | → raw bytes | resolve `salt.bin` (404 if missing = first run, cache-busted) |
 | `/upload-salt` | POST | raw bytes | git-commit `salt.bin` |
-| `/get-manifest` | GET | → raw bytes | resolve `manifest.enc` |
+| `/get-manifest` | GET | → raw bytes | resolve `manifest.enc` (cache-busted) |
 | `/upload-manifest` | POST | raw bytes | git-commit `manifest.enc` |
-| `/get-bundle` | GET | → raw bytes | resolve `thumbs.bundle` |
+| `/get-bundle` | GET | → raw bytes | resolve `thumbs.bundle` (cache-busted) |
 | `/upload-bundle` | POST | raw bytes | git-commit `thumbs.bundle` |
 | `/get-file/:id` | GET | → raw bytes | resolve `files/<id>.enc` |
-| `/upload-file?id=...` | POST | raw bytes | **LFS-aware** upload (see below) |
+| `/upload-file?id=...` | POST | raw bytes | **LFS-aware** upload (takes optional `&commit=false` to defer git commits) |
 | `/preauth-upload` | POST | → JSON | Direct-to-S3 step 1: negotiate LFS credentials (preupload + LFS batch) using metadata, return S3 upload URL & headers (or check if alreadyExists) |
 | `/commit-upload` | POST | → JSON | Direct-to-S3 step 2: finalize LFS upload (optional LFS verify + commit LFS pointer) |
-| `/list` | GET | → JSON `[id,...]` | list `files/` tree, strip prefix/suffix |
+| `/commit-batch` | POST | → JSON | Transactional single Git commit containing multiple LFS pointers, manifest, and bundle to Hugging Face |
+| `/list` | GET | → JSON `[id,...]` | list `files/` tree, strip prefix/suffix (cache-busted) |
 
 ### Direct-to-S3 Handshake (`preauthUpload` & `commitUpload`)
 
