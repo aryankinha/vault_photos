@@ -1,10 +1,14 @@
 /**
  * Session cache. Holds only the *decrypted raw bytes* of the manifest and
- * thumbnail bundle in IndexedDB so the gallery loads instantly after the first
- * unlock in a session. The encryption key is NEVER written here — only RAM.
+ * thumbnail bundle so the gallery loads instantly after the first unlock in a
+ * session. The encryption key is NEVER written here — only RAM.
  *
  * The cache is wiped on lock and there is no TTL; if the worker returns a
  * fresher copy the caller can overwrite via setManifestCache/setBundleCache.
+ *
+ * Storage strategy (V3):
+ *   Manifest  → IndexedDB (small JSON, IDB is fine)
+ *   Bundle    → OPFS first (fast binary I/O), IDB as fallback for older browsers
  *
  * V2 adds a separate 'uploadQueue' object store for background sync. Each entry
  * is { id, encryptedBytes, entry } — the already-encrypted file bytes and the
@@ -12,6 +16,7 @@
  * can retry them if the tab closes mid-upload.
  */
 import { openDB } from 'idb'
+import { clearOpfsBundle, getOpfsBundle, setOpfsBundle } from '../storage/opfsCache'
 
 const DB_NAME = 'vaultphotos-session'
 // Bump version to 2 so the upgrade callback can create the new store.
@@ -54,7 +59,8 @@ function db() {
 }
 
 // ---------------------------------------------------------------------------
-// Existing functions — DO NOT CHANGE SIGNATURES
+// Manifest — stays in IndexedDB (small JSON, IDB overhead is negligible)
+// Signatures unchanged.
 // ---------------------------------------------------------------------------
 
 export async function getManifestCache() {
@@ -65,20 +71,75 @@ export async function setManifestCache(bytes) {
   await (await db()).put(STORE, bytes, MANIFEST_KEY)
 }
 
+// ---------------------------------------------------------------------------
+// Bundle — OPFS primary, IDB fallback (V3 upgrade)
+// Signatures unchanged — callers see no difference.
+// ---------------------------------------------------------------------------
+
+/**
+ * Read bundle bytes from cache.
+ * Tries OPFS first (fast); falls back to IDB.
+ * On an IDB hit after an OPFS miss, migrates the bytes to OPFS so the
+ * next read is fast (transparent one-time migration from V2 → V3).
+ *
+ * @returns {Promise<ArrayBuffer|Uint8Array|undefined>}
+ */
 export async function getBundleCache() {
-  return (await db()).get(STORE, BUNDLE_KEY)
+  // 1. Try OPFS — fastest path for modern browsers.
+  const opfsData = await getOpfsBundle()
+  if (opfsData !== null) return opfsData
+
+  // 2. Fall back to IDB.
+  const idbData = await (await db()).get(STORE, BUNDLE_KEY)
+
+  // 3. Migrate IDB → OPFS so subsequent loads use the fast path.
+  //    Fire-and-forget: migration failure is non-fatal.
+  if (idbData) {
+    void setOpfsBundle(idbData).then((ok) => {
+      // Once migrated to OPFS, remove the IDB copy to free space.
+      if (ok) return (db()).then((d) => d.delete(STORE, BUNDLE_KEY)).catch(() => {})
+    })
+  }
+
+  return idbData
 }
 
+/**
+ * Write bundle bytes to cache.
+ * Writes to OPFS when available (fast binary I/O, no IDB serialisation).
+ * Falls back to IDB on browsers that don't support OPFS.
+ *
+ * @param {ArrayBuffer|Uint8Array} bytes
+ */
 export async function setBundleCache(bytes) {
-  await (await db()).put(STORE, bytes, BUNDLE_KEY)
+  const opfsOk = await setOpfsBundle(bytes)
+  if (!opfsOk) {
+    // OPFS not available — write to IDB as the only available store.
+    await (await db()).put(STORE, bytes, BUNDLE_KEY)
+  }
+  // If OPFS succeeded, skip IDB to avoid double-writing.
+  // clearCache() will wipe OPFS so nothing lingers after lock.
 }
 
+// ---------------------------------------------------------------------------
+// Clear — wipes BOTH stores so the lock is complete
+// Signature unchanged.
+// ---------------------------------------------------------------------------
+
+/**
+ * Wipe all cached decrypted data (manifest in IDB + bundle in OPFS/IDB).
+ * Called on vault lock and after every upload to invalidate stale data.
+ */
 export async function clearCache() {
+  // Clear IDB kv store (manifest + any legacy bundle entry).
   await (await db()).clear(STORE)
+  // Clear OPFS bundle.
+  await clearOpfsBundle()
 }
 
 // ---------------------------------------------------------------------------
 // V2 — upload queue (for background sync / tab-close recovery)
+// Signatures unchanged.
 // ---------------------------------------------------------------------------
 
 /**

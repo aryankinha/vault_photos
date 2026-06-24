@@ -21,14 +21,13 @@
  */
 import { encryptPacked } from '../crypto/encrypt'
 import { getActiveKey } from '../crypto/keyDerivation'
-import { addEntry } from '../storage/manifest'
+import { addEntry, loadManifest, serializeManifestCompressed } from '../storage/manifest'
 import { appendThumb } from '../storage/bundle'
 import { readMediaMetadata } from '../utils/exif'
 import { generateThumbnail } from '../utils/thumbnail'
 import { generateMediaId } from '../utils/uuid'
 import { clearCache, queueUpload, dequeueUpload } from '../session/cache'
 import { EtaTracker } from '../utils/eta'
-import { loadManifest } from '../storage/manifest'
 import { encryptPacked as encryptPackedCrypto } from '../crypto/encrypt'
 import * as worker from '../storage/workerClient'
 import {
@@ -308,9 +307,9 @@ export async function uploadMediaBatch(files, onBatchProgress) {
     }
     manifest.updated_at = new Date().toISOString()
 
-    // 5. Encrypt manifest locally
-    const manifestBytes = new TextEncoder().encode(JSON.stringify(manifest))
-    const encryptedManifest = new Uint8Array(await encryptPackedCrypto(manifestBytes, getActiveKey()))
+    // 5. Compress + encrypt manifest (gzip then AES-GCM — same path as saveManifest)
+    const manifestCompressedBytes = await serializeManifestCompressed(manifest)
+    const encryptedManifest = new Uint8Array(await encryptPackedCrypto(manifestCompressedBytes, getActiveKey()))
 
     // 6. Make ONE SINGLE Git commit on the worker to finalize the batch
     const filesToCommitInBatch = succeededIndices.map((i) => commitDescriptors[i])
