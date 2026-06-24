@@ -2,6 +2,7 @@
 // `argon2-browser` entry does `require('../dist/argon2.wasm')`, which Vite
 // cannot resolve at build time. The bundled build sidesteps that entirely.
 import argon2 from 'argon2-browser/dist/argon2-bundled.min.js'
+import { setPoolKey, clearPoolKey } from '../workers/cryptoWorkerPool'
 
 const ARGON2_OPTIONS = {
   time: 3,
@@ -25,6 +26,9 @@ export async function deriveKeyFromPassphrase(passphrase, salt) {
   })
 
   const rawKey = result.hash
+  // Register the raw key bytes with the worker pool BEFORE the key is imported
+  // as non-extractable (once imported as extractable:false, we can't get them back).
+  setPoolKey(new Uint8Array(rawKey))
   return crypto.subtle.importKey('raw', rawKey, 'AES-GCM', false, ['encrypt', 'decrypt'])
 }
 
@@ -47,4 +51,6 @@ export function hasActiveKey() {
 
 export function clearActiveKey() {
   activeKey = null
+  // Clear the worker pool key to avoid stale key material after lock.
+  clearPoolKey()
 }

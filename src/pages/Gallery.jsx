@@ -6,7 +6,7 @@ import { useGallery } from '../hooks/useGallery'
 import { useUploadContext } from '../context/useUploadContext'
 
 export function Gallery() {
-  const { entries, thumbs, loading, error, reload } = useGallery()
+  const { entries, thumbs, loading, thumbsLoading, error, reload } = useGallery()
   const { isUploading } = useUploadContext()
   const [filter, setFilter] = useState('all')
 
@@ -92,7 +92,16 @@ export function Gallery() {
             </p>
           </div>
         ) : (
-          <PhotoGrid entries={filteredEntries} thumbs={thumbs} />
+          <>
+            <PhotoGrid entries={filteredEntries} thumbs={thumbs} />
+            {/* Subtle indicator that thumbnails are still streaming in */}
+            {thumbsLoading && entries.length > 0 && (
+              <div className="flex items-center justify-center gap-2 pb-6 text-xs text-neutral-600">
+                <Loader2 className="animate-spin" size={12} />
+                <span>Loading thumbnails…</span>
+              </div>
+            )}
+          </>
         )}
       </main>
     </div>
@@ -135,3 +144,4 @@ function ErrorState({ error, onRetry }) {
     </div>
   )
 }
+

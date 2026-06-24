@@ -1,1 +1,23 @@
 @import "tailwindcss";
+
+/* ── VaultPhotos global animations ─────────────────────────────────────────── */
+
+/**
+ * vp-shimmer: sweeps a lighter stripe left→right across the skeleton tiles
+ * while thumbnails are decrypting in the background (Phase 2 progressive load).
+ */
+@keyframes vp-shimmer {
+  0%   { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* Stop all decorative animations for users who prefer reduced motion. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

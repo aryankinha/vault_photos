@@ -4,6 +4,9 @@ import { Play } from 'lucide-react'
 /**
  * Single thumbnail tile. Reads its image bytes from the gallery's in-memory
  * thumb map (object URL memoized by parent to avoid re-creating per render).
+ *
+ * V3: When thumbUrl is absent the card shows an animated shimmer skeleton
+ * instead of the old "No thumb" text. Thumbnails fade in on arrival.
  */
 export function PhotoCard({ entry, thumbUrl, onClick }) {
   const navigate = useNavigate()
@@ -19,18 +22,29 @@ export function PhotoCard({ entry, thumbUrl, onClick }) {
       onClick={open}
       className="group relative block aspect-square w-full overflow-hidden rounded-lg bg-neutral-900 ring-1 ring-white/5"
     >
-      {thumbUrl ? (
+      {/* Shimmer skeleton — visible while thumb is loading */}
+      {!thumbUrl && (
+        <div
+          aria-hidden="true"
+          className="absolute inset-0"
+          style={{
+            background: 'linear-gradient(90deg, #1a1a1a 25%, #252525 50%, #1a1a1a 75%)',
+            backgroundSize: '200% 100%',
+            animation: 'vp-shimmer 1.6s ease-in-out infinite',
+          }}
+        />
+      )}
+
+      {thumbUrl && (
         <img
           src={thumbUrl}
           alt={entry.name}
           loading="lazy"
-          className="h-full w-full object-cover transition duration-200 group-hover:brightness-110"
+          className="h-full w-full object-cover transition-opacity duration-300 group-hover:brightness-110"
+          style={{ opacity: thumbUrl ? 1 : 0 }}
         />
-      ) : (
-        <div className="flex h-full w-full items-center justify-center text-neutral-600">
-          <span className="text-[10px]">No thumb</span>
-        </div>
       )}
+
       {entry.type === 'video' && (
         <>
           <span className="pointer-events-none absolute inset-0 flex items-center justify-center">
@@ -59,3 +73,4 @@ function formatDuration(seconds) {
 export function VideoThumb({ entry, thumbUrl, onClick }) {
   return <PhotoCard entry={entry} thumbUrl={thumbUrl} onClick={onClick} />
 }
+

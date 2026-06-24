@@ -1,3 +1,6 @@
+import { encryptWithPool as poolEncrypt } from '../workers/cryptoWorkerPool'
+import { getActiveKey } from './keyDerivation'
+
 const NONCE_BYTES = 12
 
 export async function encryptArrayBuffer(buffer, key) {
@@ -17,4 +20,26 @@ export async function encryptPacked(buffer, key) {
   output.set(nonce, 0)
   output.set(new Uint8Array(ciphertext), nonce.byteLength)
   return output.buffer
+}
+
+/**
+ * Worker-pool backed version of encryptPacked().
+ *
+ * Transfers the buffer to a worker thread (zero-copy). Falls back to the
+ * main-thread encryptPacked() if the pool key is not set.
+ *
+ * IMPORTANT: The input `buffer` is transferred — callers must not use it after
+ * this call. If you need the original data, copy it first.
+ *
+ * @param {ArrayBuffer|Uint8Array} buffer — plaintext to encrypt
+ * @returns {Promise<ArrayBuffer>} — [nonce | ciphertext+tag]
+ */
+export async function encryptPackedOffThread(buffer) {
+  const buf = buffer instanceof ArrayBuffer ? buffer : buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength)
+  try {
+    return await poolEncrypt(buf)
+  } catch {
+    // Pool not initialised or key not set — fall back to main thread.
+    return encryptPacked(buf, getActiveKey())
+  }
 }
