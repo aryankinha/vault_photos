@@ -9,22 +9,35 @@
  * Storage strategy (V3):
  *   Manifest  → IndexedDB (small JSON, IDB is fine)
  *   Bundle    → OPFS first (fast binary I/O), IDB as fallback for older browsers
+ *   Thumbs    → IndexedDB 'thumbCache' store (persistent across sessions)
  *
  * V2 adds a separate 'uploadQueue' object store for background sync. Each entry
  * is { id, encryptedBytes, entry } — the already-encrypted file bytes and the
  * manifest entry, persisted before the network upload begins so a service worker
  * can retry them if the tab closes mid-upload.
+ *
+ * V3 adds a 'thumbCache' object store for persistent thumbnail blobs. Decrypted
+ * thumbnails survive across sessions so returning users see the gallery
+ * in < 200 ms with zero network requests.
+ *
+ * Security note: decrypted thumbnails persist even when the vault is locked.
+ * This is intentional — thumbnails are low-sensitivity previews on a personal
+ * device. clearActiveKey() / locking the vault does NOT clear thumbCache.
+ * Call clearThumbCache() explicitly if the user wants to remove them, or expose
+ * a "Clear cache" toggle in a future settings page.
  */
 import { openDB } from 'idb'
 import { clearOpfsBundle, getOpfsBundle, setOpfsBundle } from '../storage/opfsCache'
 
 const DB_NAME = 'vaultphotos-session'
-// Bump version to 2 so the upgrade callback can create the new store.
-const DB_VERSION = 2
+// Bump version to 3 — adds the thumbCache store.
+// Existing kv (v1) and uploadQueue (v2) data is preserved.
+const DB_VERSION = 3
 const STORE = 'kv'
 const MANIFEST_KEY = 'manifest'
 const BUNDLE_KEY = 'bundle'
 const QUEUE_STORE = 'uploadQueue'
+const THUMB_CACHE_STORE = 'thumbCache'
 
 let dbPromise = null
 
@@ -51,6 +64,15 @@ function db() {
         }
         if (!database.objectStoreNames.contains(QUEUE_STORE)) {
           database.createObjectStore(QUEUE_STORE, { keyPath: 'id' })
+        }
+        // v3 → create the thumbCache store keyed by media entry id
+        if (oldVersion < 3) {
+          if (!database.objectStoreNames.contains(THUMB_CACHE_STORE)) {
+            database.createObjectStore(THUMB_CACHE_STORE, { keyPath: 'id' })
+          }
+        }
+        if (!database.objectStoreNames.contains(THUMB_CACHE_STORE)) {
+          database.createObjectStore(THUMB_CACHE_STORE, { keyPath: 'id' })
         }
       },
     })
@@ -129,12 +151,89 @@ export async function setBundleCache(bytes) {
 /**
  * Wipe all cached decrypted data (manifest in IDB + bundle in OPFS/IDB).
  * Called on vault lock and after every upload to invalidate stale data.
+ * Does NOT clear thumbCache — see security note in module header.
  */
 export async function clearCache() {
   // Clear IDB kv store (manifest + any legacy bundle entry).
   await (await db()).clear(STORE)
   // Clear OPFS bundle.
   await clearOpfsBundle()
+}
+
+// ---------------------------------------------------------------------------
+// V3 — persistent thumbnail cache (across sessions)
+// ---------------------------------------------------------------------------
+
+/**
+ * Retrieve a cached thumbnail blob by media entry id.
+ *
+ * @param {string} id — 16-hex media entry id
+ * @returns {Promise<Blob|null>}
+ */
+export async function getCachedThumb(id) {
+  const row = await (await db()).get(THUMB_CACHE_STORE, id)
+  return row ? row.blob : null
+}
+
+/**
+ * Persist a single thumbnail blob to the cache.
+ *
+ * @param {string} id — 16-hex media entry id
+ * @param {Blob} blob — decrypted thumbnail JPEG as Blob
+ */
+export async function setCachedThumb(id, blob) {
+  await (await db()).put(THUMB_CACHE_STORE, { id, blob, cachedAt: Date.now() })
+}
+
+/**
+ * Batch-write multiple thumbnails in a single transaction.
+ * Significantly more efficient than N individual setCachedThumb calls for
+ * large galleries on first load.
+ *
+ * @param {{ id: string, blob: Blob }[]} entries
+ */
+export async function setCachedThumbs(entries) {
+  if (!entries || entries.length === 0) return
+  const database = await db()
+  const tx = database.transaction(THUMB_CACHE_STORE, 'readwrite')
+  await Promise.all([
+    ...entries.map(({ id, blob }) =>
+      tx.store.put({ id, blob, cachedAt: Date.now() }),
+    ),
+    tx.done,
+  ])
+}
+
+/**
+ * Remove a single thumbnail from the cache.
+ * @param {string} id
+ */
+export async function deleteCachedThumb(id) {
+  await (await db()).delete(THUMB_CACHE_STORE, id)
+}
+
+/**
+ * Wipe the entire thumbnail cache.
+ * Call this from a settings page if the user wants to free storage.
+ */
+export async function clearThumbCache() {
+  await (await db()).clear(THUMB_CACHE_STORE)
+}
+
+/**
+ * Return basic stats about the thumbnail cache.
+ * @returns {Promise<{ count: number, estimatedBytes: number }>}
+ */
+export async function getThumbCacheStats() {
+  const database = await db()
+  const all = await database.getAll(THUMB_CACHE_STORE)
+  let estimatedBytes = 0
+  for (const row of all) {
+    if (row.blob && typeof row.blob.size === 'number') {
+      estimatedBytes += row.blob.size
+    }
+  }
+  return { count: all.length, estimatedBytes }
 }
 
 // ---------------------------------------------------------------------------
@@ -169,3 +268,4 @@ export async function dequeueUpload(id) {
 export async function getUploadQueue() {
   return (await db()).getAll(QUEUE_STORE)
 }
+

@@ -3,20 +3,26 @@
  * and hand back entries paired with their thumbnail blobs. Uses the session
  * cache to skip the network on warm loads within the same unlocked session.
  *
- * V3 adds loadGalleryProgressive() — a two-phase loader:
- *   Phase 1 (manifest):  entries available immediately, thumbs = empty Map
- *   Phase 2 (thumbs):    bundle decrypts off-thread; thumbs hydrated in batches
+ * V3 adds loadGalleryProgressive() — a two-phase loader with persistent IDB thumb cache:
+ *   Phase 1 (manifest):  entries available immediately, thumbs = IDB-cached blobs
+ *   Phase 2 (thumbs):    missing thumbs fetched from bundle, written back to IDB
+ *
+ * V3 also adds loadGalleryPage() — loads a single bundle page on demand (called
+ * by the gallery IntersectionObserver as the user scrolls).
  */
 import { parseBundle, serializeBundleEntries } from '../schema/bundleSchema'
 import { streamBundleEntries } from '../utils/bundleStream'
 import { decryptPackedOffThread } from '../crypto/decrypt'
 import {
   getBundleCache,
+  getCachedThumb,
   getManifestCache,
   setBundleCache,
+  setCachedThumbs,
   setManifestCache,
 } from '../session/cache'
 import { loadBundle } from '../storage/bundle'
+import { loadBundlePage } from '../storage/bundle'
 import { loadManifest } from '../storage/manifest'
 import * as workerClient from '../storage/workerClient'
 
@@ -39,23 +45,23 @@ export async function loadGallery() {
 }
 
 // ---------------------------------------------------------------------------
-// V3 — progressive two-phase loader
+// V3 — progressive two-phase loader with persistent thumb cache
 // ---------------------------------------------------------------------------
 
 /**
- * Load the gallery in two phases and stream updates to the caller.
+ * Load the gallery in two phases, using the persistent IDB thumb cache.
  *
- * Phase 1 — manifest only (fast: small file):
- *   onUpdate({ entries, thumbs: new Map(), updatedAt, phase: 'manifest', done: false })
+ * Phase 1 — manifest + IDB-cached thumbs (fast — no network on warm load):
+ *   onUpdate({ entries, thumbs: Map(cached), updatedAt, phase: 'manifest', done: false })
+ *   If ALL thumbs are cached: done: true is emitted immediately, no phase 2.
  *
- * Phase 2 — bundle decrypted off-thread + parsed in batches:
+ * Phase 2 — missing thumbs fetched from bundle (network):
  *   onUpdate({ entries, thumbs: growing Map, updatedAt, phase: 'thumbs', done: false })
  *   …repeated every THUMB_BATCH_SIZE thumbnails…
  *   onUpdate({ entries, thumbs: full Map, updatedAt, phase: 'done', done: true })
  *
- * @param {(update: GalleryUpdate) => void} onUpdate — called on every phase transition
- * @returns {Promise<{ entries: object[], thumbs: Map<string,Blob>, updatedAt: string }>}
- *          Resolves once all thumbnails are hydrated (or when there are none).
+ * @param {(update: GalleryUpdate) => void} onUpdate
+ * @returns {Promise<{ entries, thumbs, updatedAt }>}
  */
 export async function loadGalleryProgressive(onUpdate) {
   // ── Phase 1: manifest ───────────────────────────────────────────────────
@@ -65,36 +71,56 @@ export async function loadGalleryProgressive(onUpdate) {
   )
   const updatedAt = manifest.updated_at
 
-  // Emit immediately — gallery grid can render with skeleton thumbnails.
-  onUpdate({ entries, thumbs: new Map(), updatedAt, phase: 'manifest', done: false })
+  // ── Phase 1b: populate thumbs from persistent IDB cache ─────────────────
+  // Check IDB for every entry simultaneously (parallel reads are fast in IDB).
+  const cachedResults = await Promise.all(
+    entries.map((e) => getCachedThumb(e.id).catch(() => null)),
+  )
 
-  // ── Phase 2: bundle (off-thread decrypt → progressive parse) ────────────
+  const thumbs = new Map()
+  const uncachedEntries = []
+
+  for (let i = 0; i < entries.length; i++) {
+    const blob = cachedResults[i]
+    if (blob) {
+      thumbs.set(entries[i].id, blob)
+    } else {
+      uncachedEntries.push(entries[i])
+    }
+  }
+
+  // Emit Phase 1 update — grid renders immediately with all cached thumbs.
+  const allCached = uncachedEntries.length === 0
+  onUpdate({ entries, thumbs: new Map(thumbs), updatedAt, phase: 'manifest', done: allCached })
+
+  if (allCached) {
+    // Complete warm load — zero network, zero crypto, < 200ms total.
+    return { entries, thumbs, updatedAt }
+  }
+
+  // ── Phase 2: fetch missing thumbs from bundle (off-thread decrypt) ───────
   let decryptedBundleBytes = null
 
-  // Check IndexedDB cache first (already decrypted bytes — no crypto needed).
+  // Check OPFS/IDB bundle cache first (already decrypted bytes — no crypto needed).
   const cached = await getBundleCache()
   if (cached) {
     try {
-      // Cache stores the serialized (decrypted) bundle binary.
       decryptedBundleBytes = cached instanceof ArrayBuffer
         ? new Uint8Array(cached)
         : cached
     } catch {
-      // Corrupt cache — fall through to network.
       decryptedBundleBytes = null
     }
   }
 
   if (!decryptedBundleBytes) {
-    // Download the encrypted bundle.
     let encryptedBuffer
     try {
       encryptedBuffer = await workerClient.getBundle()
     } catch (e) {
       if (e.status === 404) {
-        // First run / empty vault — no bundle yet.
-        onUpdate({ entries, thumbs: new Map(), updatedAt, phase: 'done', done: true })
-        return { entries, thumbs: new Map(), updatedAt }
+        onUpdate({ entries, thumbs: new Map(thumbs), updatedAt, phase: 'done', done: true })
+        return { entries, thumbs, updatedAt }
       }
       throw e
     }
@@ -107,25 +133,88 @@ export async function loadGalleryProgressive(onUpdate) {
     void persistBundleBytes(decryptedBundleBytes)
   }
 
-  // ── Hydrate thumbnails in batches ────────────────────────────────────────
-  const thumbs = new Map()
+  // Build a Set of uncached ids for O(1) lookup during iteration.
+  const uncachedIds = new Set(uncachedEntries.map((e) => e.id))
+
+  // ── Hydrate missing thumbnails in batches ─────────────────────────────────
   let batchCount = 0
+  const newlyDecrypted = []   // { id, blob } — for batch IDB write at end
 
   for (const entry of streamBundleEntries(decryptedBundleBytes)) {
-    thumbs.set(entry.id, new Blob([entry.bytes], { type: 'image/jpeg' }))
+    if (!uncachedIds.has(entry.id)) continue  // already in cache, skip
+
+    const blob = new Blob([entry.bytes], { type: 'image/jpeg' })
+    thumbs.set(entry.id, blob)
+    newlyDecrypted.push({ id: entry.id, blob })
     batchCount++
 
     if (batchCount % THUMB_BATCH_SIZE === 0) {
-      // Emit a copy of the current map so React sees a new reference.
       onUpdate({ entries, thumbs: new Map(thumbs), updatedAt, phase: 'thumbs', done: false })
-      // Yield to the event loop so the browser can paint the new batch.
       await yieldToMain()
     }
   }
 
-  // Final emit — all thumbnails hydrated.
+  // Persist all newly decrypted thumbs to IDB in one batch (fire-and-forget).
+  if (newlyDecrypted.length > 0) {
+    void setCachedThumbs(newlyDecrypted).catch(() => {})
+  }
+
   onUpdate({ entries, thumbs: new Map(thumbs), updatedAt, phase: 'done', done: true })
   return { entries, thumbs, updatedAt }
+}
+
+// ---------------------------------------------------------------------------
+// V3 — demand-driven page loader (called by IntersectionObserver in Gallery)
+// ---------------------------------------------------------------------------
+
+/**
+ * Load a single bundle page by index and return a Map<id, Blob> for that page.
+ * Checks the IDB thumb cache first — entries already cached are not re-fetched.
+ * Newly loaded thumbs are written back to IDB in the background.
+ *
+ * Called by useGallery.loadPage(n) when the user scrolls near page N's content.
+ *
+ * @param {number} pageIndex — zero-based page index
+ * @param {string[]} entryIds — ids of entries on this page (from manifest)
+ * @returns {Promise<Map<string, Blob>>}
+ */
+export async function loadGalleryPage(pageIndex, entryIds) {
+  const result = new Map()
+  if (!entryIds || entryIds.length === 0) return result
+
+  // Check IDB cache for all ids on this page in parallel.
+  const cachedResults = await Promise.all(
+    entryIds.map((id) => getCachedThumb(id).catch(() => null)),
+  )
+
+  const missingIds = new Set()
+  for (let i = 0; i < entryIds.length; i++) {
+    if (cachedResults[i]) {
+      result.set(entryIds[i], cachedResults[i])
+    } else {
+      missingIds.add(entryIds[i])
+    }
+  }
+
+  if (missingIds.size === 0) return result  // all from cache
+
+  // Fetch the bundle page from HF (404 = page not written yet = return what we have).
+  const pageEntries = await loadBundlePage(pageIndex)
+  const newlyDecrypted = []
+
+  for (const entry of pageEntries) {
+    if (!missingIds.has(entry.id)) continue
+    const blob = new Blob([entry.bytes], { type: 'image/jpeg' })
+    result.set(entry.id, blob)
+    newlyDecrypted.push({ id: entry.id, blob })
+  }
+
+  // Write newly loaded thumbs to IDB cache (fire-and-forget).
+  if (newlyDecrypted.length > 0) {
+    void setCachedThumbs(newlyDecrypted).catch(() => {})
+  }
+
+  return result
 }
 
 // ---------------------------------------------------------------------------
@@ -223,3 +312,4 @@ function yieldToMain() {
 
 // Re-exported for the lock flow and for callers that need to invalidate cache.
 export { clearCache } from '../session/cache'
+

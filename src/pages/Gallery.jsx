@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect, useRef } from 'react'
+import { useState, useMemo, useEffect, useRef, useCallback } from 'react'
 import { ImageOff, Loader2, RefreshCw, LayoutGrid, Image as ImageIcon, Film } from 'lucide-react'
 import { Topbar } from '../components/Topbar'
 import { PhotoGrid } from '../components/PhotoGrid'
@@ -6,7 +6,11 @@ import { useGallery } from '../hooks/useGallery'
 import { useUploadContext } from '../context/useUploadContext'
 
 export function Gallery() {
-  const { entries, thumbs, loading, thumbsLoading, error, reload } = useGallery()
+  const {
+    entries, thumbs, loading, thumbsLoading,
+    loadingPage, totalPages, loadedPages, loadPage,
+    error, reload,
+  } = useGallery()
   const { isUploading } = useUploadContext()
   const [filter, setFilter] = useState('all')
 
@@ -25,6 +29,40 @@ export function Gallery() {
     if (filter === 'videos') return entries.filter((e) => e.type === 'video')
     return entries
   }, [entries, filter])
+
+  // ---------------------------------------------------------------------------
+  // IntersectionObserver — trigger loadPage when user nears the bottom
+  // ---------------------------------------------------------------------------
+  const sentinelRef = useRef(null)
+
+  const nextPage = useMemo(() => {
+    for (let p = 0; p < totalPages; p++) {
+      if (!loadedPages.has(p)) return p
+    }
+    return null  // all pages loaded
+  }, [totalPages, loadedPages])
+
+  const handleLoadNextPage = useCallback(() => {
+    if (nextPage !== null && !loadingPage) {
+      loadPage(nextPage)
+    }
+  }, [nextPage, loadingPage, loadPage])
+
+  useEffect(() => {
+    const sentinel = sentinelRef.current
+    if (!sentinel || nextPage === null) return
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0]?.isIntersecting) {
+          handleLoadNextPage()
+        }
+      },
+      { rootMargin: '500px' },  // trigger 500px before the sentinel enters viewport
+    )
+    observer.observe(sentinel)
+    return () => observer.disconnect()
+  }, [nextPage, handleLoadNextPage])
 
   return (
     <div className="min-h-screen bg-neutral-950">
@@ -94,11 +132,23 @@ export function Gallery() {
         ) : (
           <>
             <PhotoGrid entries={filteredEntries} thumbs={thumbs} />
+
             {/* Subtle indicator that thumbnails are still streaming in */}
             {thumbsLoading && entries.length > 0 && (
-              <div className="flex items-center justify-center gap-2 pb-6 text-xs text-neutral-600">
+              <div className="flex items-center justify-center gap-2 pb-4 text-xs text-neutral-600">
                 <Loader2 className="animate-spin" size={12} />
                 <span>Loading thumbnails…</span>
+              </div>
+            )}
+
+            {/* Sentinel div — IntersectionObserver triggers next page load */}
+            {nextPage !== null && <div ref={sentinelRef} aria-hidden="true" className="h-px" />}
+
+            {/* Page loading indicator */}
+            {loadingPage && (
+              <div className="flex items-center justify-center gap-2 py-6 text-xs text-neutral-600">
+                <Loader2 className="animate-spin" size={12} />
+                <span>Loading more…</span>
               </div>
             )}
           </>
