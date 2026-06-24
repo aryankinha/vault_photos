@@ -186,6 +186,14 @@ export function shutdownPool() {
   nextWorkerIndex = 0
 }
 
+/**
+ * Singleton pool instance — import this to call terminate() on vault lock.
+ */
+export const cryptoPool = {
+  terminate: shutdownPool,
+}
+
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

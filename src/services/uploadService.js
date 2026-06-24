@@ -1,5 +1,5 @@
 /**
- * Upload orchestration — V2.
+ * Upload orchestration — V3.
  *
  * Two upload paths, chosen by encrypted size:
  *   < DIRECT_UPLOAD_THRESHOLD  → proxy through the worker (XHR with progress)
@@ -7,8 +7,8 @@
  *
  * Exports:
  *   uploadMedia(file, onProgress)         — V1 single-file path, UNCHANGED
- *   uploadMediaBatch(files, onBatchProgress) — V2 batch path (parallel uploads,
- *                                            one manifest+bundle round-trip)
+ *   uploadMediaBatch(files, onBatchProgress, optimisticCallbacks)
+ *                                          — V3 batch path with optimistic UI support
  *
  * Progress callback shapes:
  *   uploadMedia: { phase: 'reading'|'encrypting'|'uploading'|'finalizing'|'done' }
@@ -19,14 +19,14 @@
  *     overallPercent, etaDisplay, errors
  *   }
  */
-import { encryptPacked } from '../crypto/encrypt'
+import { encryptPacked, encryptWithPool } from '../crypto/encrypt'
 import { getActiveKey } from '../crypto/keyDerivation'
 import { addEntry, loadManifest, serializeManifestCompressed } from '../storage/manifest'
 import { appendThumb } from '../storage/bundle'
 import { readMediaMetadata } from '../utils/exif'
 import { generateThumbnail } from '../utils/thumbnail'
 import { generateMediaId } from '../utils/uuid'
-import { clearCache, queueUpload, dequeueUpload } from '../session/cache'
+import { clearCache, queueUpload, dequeueUpload, setCachedThumb } from '../session/cache'
 import { EtaTracker } from '../utils/eta'
 import { encryptPacked as encryptPackedCrypto } from '../crypto/encrypt'
 import * as worker from '../storage/workerClient'
@@ -101,11 +101,20 @@ export async function uploadMedia(file, onProgress) {
  *   - Single bundle update at the end
  *   - Single clearCache() at the end
  *
+ * V3: accepts optional optimisticCallbacks for instant gallery appearance.
+ *
  * @param {File[]} files
  * @param {(progress: BatchProgress) => void} onBatchProgress
+ * @param {{ addOptimisticEntry, updateOptimisticState, removeOptimisticEntry, markOptimisticError }} [optimisticCallbacks]
  * @returns {Promise<{ entries: object[], errors: { file: File, error: Error }[] }>}
  */
-export async function uploadMediaBatch(files, onBatchProgress) {
+export async function uploadMediaBatch(files, onBatchProgress, optimisticCallbacks = {}) {
+  const {
+    addOptimisticEntry,
+    updateOptimisticState,
+    removeOptimisticEntry,
+    markOptimisticError,
+  } = optimisticCallbacks
   const totalFiles = files.length
   const errors = []
 
@@ -128,10 +137,30 @@ export async function uploadMediaBatch(files, onBatchProgress) {
     files.map(async (file) => {
       const meta = await readMediaMetadata(file)
       const thumbnail = await generateThumbnail(file, meta.type)
+      const thumbBlob = thumbnail                              // Blob from generateThumbnail
       const thumbBytes = new Uint8Array(await thumbnail.arrayBuffer())
       const fileBytes = new Uint8Array(await file.arrayBuffer())
-      const encrypted = new Uint8Array(await encryptPacked(fileBytes, getActiveKey()))
+
+      // V3: use the crypto worker pool for file body encryption (off main thread).
+      // Manifest + bundle encryption still use encryptPacked (small, no threading benefit).
+      const encrypted = new Uint8Array(await encryptWithPool(fileBytes, getActiveKey()))
       const id = generateMediaId()
+
+      // V3: cache the thumbnail immediately — gallery will find it on next open.
+      void setCachedThumb(id, thumbBlob).catch(() => {})
+
+      // V3: add the entry to the gallery NOW, before any network request.
+      const optimisticEntry = {
+        id,
+        name: file.name,
+        type: meta.type,
+        date_taken: meta.date_taken,
+        size: file.size,
+        duration: meta.duration ?? null,
+        thumb_offset: 0,   // placeholder — not known until bundle is written
+        thumb_length: thumbBytes.byteLength,
+      }
+      if (addOptimisticEntry) addOptimisticEntry(optimisticEntry, thumbBlob)
 
       // Queue the upload in IndexedDB for Background Sync before network starts
       const initialEntry = {
@@ -144,7 +173,7 @@ export async function uploadMediaBatch(files, onBatchProgress) {
       }
       await queueUpload(id, encrypted, initialEntry)
 
-      return { file, meta, thumbBytes, encrypted, id, initialEntry }
+      return { file, meta, thumbBytes, thumbBlob, encrypted, id, initialEntry }
     }),
   )
 
@@ -176,36 +205,48 @@ export async function uploadMediaBatch(files, onBatchProgress) {
   }
 
   async function uploadOne(pf, index) {
-    emitProgress(index, 'uploading')
-    
-    // Call uploadEncryptedFile with commit = false to defer the Git commit
-    const uploadRes = await uploadEncryptedFile(pf.id, pf.encrypted, (e) => {
-      perFileLoaded[index] = e.loaded
-      emitProgress(index, 'uploading')
-    }, false)
-    
-    // Retrieve sha256 and size
-    let sha256, size
-    if (uploadRes instanceof ArrayBuffer) {
-      // Proxy upload returned raw JSON arraybuffer
-      const json = JSON.parse(new TextDecoder().decode(uploadRes))
-      sha256 = json.sha256
-      size = json.size
-    } else if (uploadRes && uploadRes.sha256) {
-      // Direct upload returned { sha256, size }
-      sha256 = uploadRes.sha256
-      size = uploadRes.size
-    } else {
-      // Fallback
-      sha256 = await computeSha256Hex(pf.encrypted)
-      size = pf.encrypted.byteLength
+    // V3: update optimistic state → 'uploading'
+    if (updateOptimisticState) {
+      updateOptimisticState(pf.id, { status: 'uploading', progress: 0, error: null })
     }
-    
-    commitDescriptors[index] = { id: pf.id, sha256, size }
-    perFileLoaded[index] = pf.encrypted.byteLength
-    
-    // Dequeue successfully uploaded file from IndexedDB background sync queue
-    await dequeueUpload(pf.id)
+    emitProgress(index, 'uploading')
+
+    try {
+      // Call uploadEncryptedFile with commit = false to defer the Git commit
+      const uploadRes = await uploadEncryptedFile(pf.id, pf.encrypted, (e) => {
+        perFileLoaded[index] = e.loaded
+        // V3: update fine-grained upload progress
+        if (updateOptimisticState) {
+          const p = pf.encrypted.byteLength > 0 ? e.loaded / pf.encrypted.byteLength : 0
+          updateOptimisticState(pf.id, { status: 'uploading', progress: p, error: null })
+        }
+        emitProgress(index, 'uploading')
+      }, false)
+
+      // Retrieve sha256 and size
+      let sha256, size
+      if (uploadRes instanceof ArrayBuffer) {
+        const json = JSON.parse(new TextDecoder().decode(uploadRes))
+        sha256 = json.sha256
+        size = json.size
+      } else if (uploadRes && uploadRes.sha256) {
+        sha256 = uploadRes.sha256
+        size = uploadRes.size
+      } else {
+        sha256 = await computeSha256Hex(pf.encrypted)
+        size = pf.encrypted.byteLength
+      }
+
+      commitDescriptors[index] = { id: pf.id, sha256, size }
+      perFileLoaded[index] = pf.encrypted.byteLength
+
+      // Dequeue successfully uploaded file from IndexedDB background sync queue
+      await dequeueUpload(pf.id)
+    } catch (err) {
+      // V3: mark error on the optimistic card
+      if (markOptimisticError) markOptimisticError(pf.id, err.message)
+      throw err
+    }
   }
 
   const queue = [...processedFiles.entries()]
@@ -324,9 +365,17 @@ export async function uploadMediaBatch(files, onBatchProgress) {
   }
 
   // ------------------------------------------------------------------
-  // Step 4 — Clear session cache
+  // Step 4 — Clear session cache; remove optimistic entries for succeeded files
   // ------------------------------------------------------------------
   await clearCache()
+
+  // V3: remove optimistic entries for all succeeded files — the real manifest
+  // reload (triggered by Gallery.jsx after isUploading → false) will show real entries.
+  if (removeOptimisticEntry) {
+    for (const i of succeededIndices) {
+      removeOptimisticEntry(processedFiles[i].id)
+    }
+  }
 
   const succeededFiles = succeededIndices.map((i) => processedFiles[i])
   return { entries: succeededFiles, errors }

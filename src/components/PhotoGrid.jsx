@@ -6,8 +6,11 @@ import { PhotoCard } from './PhotoCard'
 /**
  * Scrollable gallery grid. Builds object URLs for thumbnails once per thumbs
  * change and revokes the previous batch on the next pass to avoid leaks.
+ *
+ * V3: Accepts optional optimisticStates Map and onRetry callback for the
+ * upload overlay rendered on optimistic entries (before HF confirms).
  */
-export function PhotoGrid({ entries, thumbs }) {
+export function PhotoGrid({ entries, thumbs, optimisticStates, onRetry }) {
   const groups = useMemo(() => groupByMonth(entries), [entries])
 
   const thumbUrls = useMemo(() => {
@@ -41,6 +44,8 @@ export function PhotoGrid({ entries, thumbs }) {
                 key={entry.id}
                 entry={entry}
                 thumbUrl={thumbUrls.get(entry.id)}
+                uploadState={optimisticStates?.get(entry.id)}
+                onRetry={onRetry}
               />
             ))}
           </div>
@@ -49,3 +54,5 @@ export function PhotoGrid({ entries, thumbs }) {
     </div>
   )
 }
+
+

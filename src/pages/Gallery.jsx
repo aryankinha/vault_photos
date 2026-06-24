@@ -11,7 +11,13 @@ export function Gallery() {
     loadingPage, totalPages, loadedPages, loadPage,
     error, reload,
   } = useGallery()
-  const { isUploading } = useUploadContext()
+  const {
+    isUploading,
+    optimisticEntries,
+    optimisticThumbs,
+    optimisticStates,
+    retryOptimistic,
+  } = useUploadContext()
   const [filter, setFilter] = useState('all')
 
   // Auto-reload when background upload finishes
@@ -25,10 +31,36 @@ export function Gallery() {
 
   // Filter entries locally based on tab
   const filteredEntries = useMemo(() => {
-    if (filter === 'photos') return entries.filter((e) => e.type === 'image')
-    if (filter === 'videos') return entries.filter((e) => e.type === 'video')
-    return entries
+    const source = [...entries]
+    if (filter === 'photos') return source.filter((e) => e.type === 'image')
+    if (filter === 'videos') return source.filter((e) => e.type === 'video')
+    return source
   }, [entries, filter])
+
+  // Merge optimistic entries into filtered list (appear at top, deduped by id)
+  const mergedEntries = useMemo(() => {
+    const realIds = new Set(filteredEntries.map((e) => e.id))
+    const pending = (optimisticEntries ?? []).filter((e) => {
+      if (!realIds.has(e.id)) {
+        if (filter === 'photos') return e.type === 'image'
+        if (filter === 'videos') return e.type === 'video'
+        return true
+      }
+      return false
+    })
+    if (pending.length === 0) return filteredEntries
+    return [
+      ...pending.sort((a, b) => b.date_taken.localeCompare(a.date_taken)),
+      ...filteredEntries,
+    ]
+  }, [filteredEntries, optimisticEntries, filter])
+
+  // Merge optimistic thumbs into the real thumb map
+  const mergedThumbs = useMemo(() => {
+    if (!optimisticThumbs || optimisticThumbs.size === 0) return thumbs
+    return new Map([...thumbs, ...optimisticThumbs])
+  }, [thumbs, optimisticThumbs])
+
 
   // ---------------------------------------------------------------------------
   // IntersectionObserver — trigger loadPage when user nears the bottom
@@ -69,7 +101,7 @@ export function Gallery() {
       <Topbar />
 
       {/* Category Tabs */}
-      {entries.length > 0 && (
+      {(entries.length > 0 || (optimisticEntries?.length ?? 0) > 0) && (
         <div className="flex justify-center gap-2 py-3 border-b border-white/5 bg-neutral-900/10">
           <button
             type="button"
@@ -111,15 +143,15 @@ export function Gallery() {
       )}
 
       <main className="pb-16">
-        {loading && entries.length === 0 ? (
+        {loading && entries.length === 0 && (optimisticEntries?.length ?? 0) === 0 ? (
           <div className="flex justify-center py-24 text-neutral-500">
             <Loader2 className="animate-spin" size={22} />
           </div>
         ) : error ? (
           <ErrorState error={error} onRetry={reload} />
-        ) : entries.length === 0 ? (
+        ) : mergedEntries.length === 0 ? (
           <EmptyState />
-        ) : filteredEntries.length === 0 ? (
+        ) : mergedEntries.length === 0 ? (
           <div className="mx-auto flex max-w-md flex-col items-center px-6 py-24 text-center">
             <span className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-white/5 text-neutral-500 ring-1 ring-white/10">
               <ImageOff size={24} />
@@ -131,7 +163,12 @@ export function Gallery() {
           </div>
         ) : (
           <>
-            <PhotoGrid entries={filteredEntries} thumbs={thumbs} />
+            <PhotoGrid
+              entries={mergedEntries}
+              thumbs={mergedThumbs}
+              optimisticStates={optimisticStates}
+              onRetry={retryOptimistic}
+            />
 
             {/* Subtle indicator that thumbnails are still streaming in */}
             {thumbsLoading && entries.length > 0 && (

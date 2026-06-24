@@ -43,3 +43,18 @@ export async function encryptPackedOffThread(buffer) {
     return encryptPacked(buf, getActiveKey())
   }
 }
+
+/**
+ * Named alias — uploadService and chunkEncrypt import this name.
+ * Delegates to encryptPackedOffThread (worker pool, falls back to main thread).
+ *
+ * @param {ArrayBuffer|Uint8Array} buffer — plaintext bytes (will be transferred)
+ * @param {CryptoKey} [_key] — ignored; pool uses the active key from keyDerivation
+ * @returns {Promise<ArrayBuffer>}
+ */
+export async function encryptWithPool(buffer, /* key intentionally unused; pool reads active key */
+  // eslint-disable-next-line no-unused-vars
+  _key) {
+  return encryptPackedOffThread(buffer)
+}
+
