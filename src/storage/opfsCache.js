@@ -15,10 +15,12 @@
  * Falls back gracefully to returning null / no-op on unsupported browsers.
  *
  * File layout (all under the OPFS root):
- *   thumbs.bundle.dec   — decrypted bundle binary (all thumbnails concatenated)
+ *   thumbs.bundle.dec       — decrypted bundle binary (all thumbnails concatenated)
+ *   media/<id>.dec          — decrypted full-resolution media file, keyed by entry id
  */
 
 const BUNDLE_FILENAME = 'thumbs.bundle.dec'
+const MEDIA_DIR = 'media'
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -43,6 +45,21 @@ async function getRoot() {
 }
 
 /**
+ * Return (or create) the media/ subdirectory under the OPFS root.
+ *
+ * @returns {Promise<FileSystemDirectoryHandle|null>}
+ */
+async function getMediaDir() {
+  const root = await getRoot()
+  if (!root) return null
+  try {
+    return await root.getDirectoryHandle(MEDIA_DIR, { create: true })
+  } catch {
+    return null
+  }
+}
+
+/**
  * Normalise input to an ArrayBuffer ready to write.
  * Handles both ArrayBuffer and Uint8Array (including non-zero-offset views).
  *
@@ -59,7 +76,7 @@ function toArrayBuffer(bytes) {
 }
 
 // ---------------------------------------------------------------------------
-// Public API
+// Bundle API (unchanged — backward compatible with existing callers)
 // ---------------------------------------------------------------------------
 
 /**
@@ -120,6 +137,92 @@ export async function clearOpfsBundle() {
     // File may not exist yet — not an error.
   }
 }
+
+// ---------------------------------------------------------------------------
+// Phase 9 — Full media file cache (media/<id>.dec)
+// ---------------------------------------------------------------------------
+
+/**
+ * Read a cached decrypted media file from OPFS.
+ *
+ * @param {string} id — 16-hex entry id
+ * @returns {Promise<ArrayBuffer|null>} — decrypted bytes, or null on cache miss
+ */
+export async function getOpfsMedia(id) {
+  const dir = await getMediaDir()
+  if (!dir) return null
+  try {
+    const fh = await dir.getFileHandle(`${id}.dec`)
+    const file = await fh.getFile()
+    return await file.arrayBuffer()
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Write a decrypted media file to OPFS.
+ * Fire-and-forget safe — callers should not await this in the hot path.
+ *
+ * @param {string} id — 16-hex entry id
+ * @param {ArrayBuffer|Uint8Array} bytes — decrypted plaintext
+ * @returns {Promise<boolean>} — true if write succeeded
+ */
+export async function setOpfsMedia(id, bytes) {
+  const dir = await getMediaDir()
+  if (!dir) return false
+  let writable = null
+  try {
+    const fh = await dir.getFileHandle(`${id}.dec`, { create: true })
+    writable = await fh.createWritable()
+    await writable.write(toArrayBuffer(bytes))
+    await writable.close()
+    writable = null
+    return true
+  } catch {
+    if (writable) {
+      try { await writable.abort() } catch { /* ignore */ }
+    }
+    return false
+  }
+}
+
+/**
+ * Delete a single media file from OPFS.
+ * Called when an entry is removed from the vault.
+ *
+ * @param {string} id
+ * @returns {Promise<void>}
+ */
+export async function deleteOpfsMedia(id) {
+  const dir = await getMediaDir()
+  if (!dir) return
+  try {
+    await dir.removeEntry(`${id}.dec`)
+  } catch {
+    // Missing file is not an error.
+  }
+}
+
+/**
+ * Wipe the entire media/ directory from OPFS.
+ * Called on vault lock — ensures no decrypted bytes persist after lock.
+ *
+ * @returns {Promise<void>}
+ */
+export async function clearOpfsMedia() {
+  const root = await getRoot()
+  if (!root) return
+  try {
+    await root.removeEntry(MEDIA_DIR, { recursive: true })
+  } catch {
+    // Directory may not exist yet on first lock — not an error.
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Feature detection
+// ---------------------------------------------------------------------------
 
 /**
  * Returns true if OPFS is available in the current browser/context.

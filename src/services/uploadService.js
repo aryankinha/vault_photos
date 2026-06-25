@@ -20,6 +20,7 @@
  *   }
  */
 import { encryptPacked, encryptWithPool } from '../crypto/encrypt'
+import { encryptFileChunks } from '../crypto/chunkEncrypt'
 import { getActiveKey } from '../crypto/keyDerivation'
 import { addEntry, loadManifest, serializeManifestCompressed } from '../storage/manifest'
 import { appendThumb } from '../storage/bundle'
@@ -40,6 +41,7 @@ import { decryptPacked } from '../crypto/decrypt'
 // transfer: the worker only authorizes (preauth) and finalizes (commit).
 // Below it, bytes are proxied through the worker via XHR.
 const DIRECT_UPLOAD_THRESHOLD = 50 * 1024 * 1024 // 50 MB
+const CHUNK_SIZE = 32 * 1024 * 1024 // 32 MB
 
 // Maximum concurrent network uploads in the batch path.
 const BATCH_CONCURRENCY = 3
@@ -56,37 +58,79 @@ export async function uploadMedia(file, onProgress) {
   const thumbnail = await generateThumbnail(file, meta.type)
   const thumbBytes = new Uint8Array(await thumbnail.arrayBuffer())
 
-  emit('encrypting')
-  const fileBytes = new Uint8Array(await file.arrayBuffer())
-  const encrypted = new Uint8Array(await encryptPacked(fileBytes, getActiveKey()))
-
-  emit('uploading')
+  const isLarge = file.size >= DIRECT_UPLOAD_THRESHOLD
   const id = generateMediaId()
 
-  // Route to direct or proxy based on encrypted size.
-  await uploadEncryptedFile(id, encrypted, (e) => {
-    onProgress && onProgress({ phase: 'uploading', percent: e.percent })
-  })
+  if (isLarge) {
+    emit('encrypting')
+    // No full-file encryption needed here. We will encrypt chunk-by-chunk.
+    
+    emit('uploading')
+    let uploadedBytes = 0
+    const chunkCount = Math.ceil(file.size / CHUNK_SIZE)
+    const generator = encryptFileChunks(file, getActiveKey(), CHUNK_SIZE)
+    for await (const chunkInfo of generator) {
+      const { index: chunkIndex, encrypted: chunkEncrypted, size: chunkRawSize } = chunkInfo
+      await worker.uploadChunk(id, chunkIndex, chunkEncrypted, (e) => {
+        const percent = file.size > 0 ? (uploadedBytes + e.loaded) / file.size : 0
+        onProgress && onProgress({ phase: 'uploading', percent })
+      })
+      uploadedBytes += chunkRawSize
+    }
 
-  const { thumb_offset, thumb_length } = await appendThumb(id, thumbBytes)
+    const { thumb_offset, thumb_length } = await appendThumb(id, thumbBytes)
 
-  const entry = {
-    id,
-    name: file.name,
-    type: meta.type,
-    date_taken: meta.date_taken,
-    size: file.size,
-    duration: meta.duration,
-    thumb_offset,
-    thumb_length,
+    const entry = {
+      id,
+      name: file.name,
+      type: meta.type,
+      date_taken: meta.date_taken,
+      size: file.size,
+      duration: meta.duration,
+      thumb_offset,
+      thumb_length,
+      chunked: true,
+      chunk_size: CHUNK_SIZE,
+      chunk_count: chunkCount,
+    }
+
+    emit('finalizing')
+    await addEntry(entry)
+    await clearCache()
+
+    emit('done')
+    return entry
+  } else {
+    emit('encrypting')
+    const fileBytes = new Uint8Array(await file.arrayBuffer())
+    const encrypted = new Uint8Array(await encryptPacked(fileBytes, getActiveKey()))
+
+    emit('uploading')
+    // Route to direct or proxy based on encrypted size.
+    await uploadEncryptedFile(id, encrypted, (e) => {
+      onProgress && onProgress({ phase: 'uploading', percent: e.percent })
+    })
+
+    const { thumb_offset, thumb_length } = await appendThumb(id, thumbBytes)
+
+    const entry = {
+      id,
+      name: file.name,
+      type: meta.type,
+      date_taken: meta.date_taken,
+      size: file.size,
+      duration: meta.duration,
+      thumb_offset,
+      thumb_length,
+    }
+
+    emit('finalizing')
+    await addEntry(entry)
+    await clearCache()
+
+    emit('done')
+    return entry
   }
-
-  emit('finalizing')
-  await addEntry(entry)
-  await clearCache()
-
-  emit('done')
-  return entry
 }
 
 // ---------------------------------------------------------------------------
@@ -139,12 +183,19 @@ export async function uploadMediaBatch(files, onBatchProgress, optimisticCallbac
       const thumbnail = await generateThumbnail(file, meta.type)
       const thumbBlob = thumbnail                              // Blob from generateThumbnail
       const thumbBytes = new Uint8Array(await thumbnail.arrayBuffer())
-      const fileBytes = new Uint8Array(await file.arrayBuffer())
 
-      // V3: use the crypto worker pool for file body encryption (off main thread).
-      // Manifest + bundle encryption still use encryptPacked (small, no threading benefit).
-      const encrypted = new Uint8Array(await encryptWithPool(fileBytes, getActiveKey()))
+      const isLarge = file.size >= DIRECT_UPLOAD_THRESHOLD
+      let encrypted = null
       const id = generateMediaId()
+
+      if (isLarge) {
+        // V3 chunked upload path doesn't encrypt the file body here.
+        // It will be encrypted chunk-by-chunk during the upload step.
+      } else {
+        const fileBytes = new Uint8Array(await file.arrayBuffer())
+        // V3: use the crypto worker pool for file body encryption (off main thread).
+        encrypted = new Uint8Array(await encryptWithPool(fileBytes, getActiveKey()))
+      }
 
       // V3: cache the thumbnail immediately — gallery will find it on next open.
       void setCachedThumb(id, thumbBlob).catch(() => {})
@@ -160,27 +211,52 @@ export async function uploadMediaBatch(files, onBatchProgress, optimisticCallbac
         thumb_offset: 0,   // placeholder — not known until bundle is written
         thumb_length: thumbBytes.byteLength,
       }
+      
+      if (isLarge) {
+        optimisticEntry.chunked = true
+        optimisticEntry.chunk_size = CHUNK_SIZE
+        optimisticEntry.chunk_count = Math.ceil(file.size / CHUNK_SIZE)
+      }
+
       if (addOptimisticEntry) addOptimisticEntry(optimisticEntry, thumbBlob)
 
       // Queue the upload in IndexedDB for Background Sync before network starts
-      const initialEntry = {
-        id,
-        name: file.name,
-        type: meta.type,
-        date_taken: meta.date_taken,
-        size: file.size,
-        duration: meta.duration,
+      if (!isLarge) {
+        const initialEntry = {
+          id,
+          name: file.name,
+          type: meta.type,
+          date_taken: meta.date_taken,
+          size: file.size,
+          duration: meta.duration,
+        }
+        await queueUpload(id, encrypted, initialEntry)
       }
-      await queueUpload(id, encrypted, initialEntry)
 
-      return { file, meta, thumbBytes, thumbBlob, encrypted, id, initialEntry }
+      return {
+        file,
+        meta,
+        thumbBytes,
+        thumbBlob,
+        encrypted,
+        id,
+        isLarge,
+        chunkSize: isLarge ? CHUNK_SIZE : undefined,
+        chunkCount: isLarge ? Math.ceil(file.size / CHUNK_SIZE) : undefined,
+      }
     }),
   )
 
   // ------------------------------------------------------------------
   // Step 2 — upload encrypted blobs with concurrency limit
   // ------------------------------------------------------------------
-  const totalEncryptedBytes = processedFiles.reduce((s, p) => s + p.encrypted.byteLength, 0)
+  const totalEncryptedBytes = processedFiles.reduce((s, p) => {
+    if (p.isLarge) {
+      const overheadPerChunk = 28 // 12 nonce + 16 tag
+      return s + p.file.size + (p.chunkCount * overheadPerChunk)
+    }
+    return s + p.encrypted.byteLength
+  }, 0)
   const eta = new EtaTracker(totalEncryptedBytes)
   const perFileLoaded = new Array(processedFiles.length).fill(0)
   let completedFiles = 0
@@ -212,36 +288,74 @@ export async function uploadMediaBatch(files, onBatchProgress, optimisticCallbac
     emitProgress(index, 'uploading')
 
     try {
-      // Call uploadEncryptedFile with commit = false to defer the Git commit
-      const uploadRes = await uploadEncryptedFile(pf.id, pf.encrypted, (e) => {
-        perFileLoaded[index] = e.loaded
-        // V3: update fine-grained upload progress
-        if (updateOptimisticState) {
-          const p = pf.encrypted.byteLength > 0 ? e.loaded / pf.encrypted.byteLength : 0
-          updateOptimisticState(pf.id, { status: 'uploading', progress: p, error: null })
+      if (pf.isLarge) {
+        // Chunked upload path
+        let uploadedBytes = 0
+        const generator = encryptFileChunks(pf.file, getActiveKey(), pf.chunkSize)
+
+        for await (const chunkInfo of generator) {
+          const { index: chunkIndex, encrypted: chunkEncrypted } = chunkInfo
+          await worker.uploadChunk(
+            pf.id,
+            chunkIndex,
+            chunkEncrypted,
+            (e) => {
+              const totalLoadedForChunk = uploadedBytes + e.loaded
+              perFileLoaded[index] = totalLoadedForChunk
+
+              if (updateOptimisticState) {
+                const approxTotalEncrypted = pf.file.size + (pf.chunkCount * 28)
+                const p = approxTotalEncrypted > 0 ? totalLoadedForChunk / approxTotalEncrypted : 0
+                updateOptimisticState(pf.id, { status: 'uploading', progress: Math.min(p, 0.99), error: null })
+              }
+              emitProgress(index, 'uploading')
+            }
+          )
+
+          uploadedBytes += chunkEncrypted.byteLength
+          perFileLoaded[index] = uploadedBytes
+
+          if (updateOptimisticState) {
+            const approxTotalEncrypted = pf.file.size + (pf.chunkCount * 28)
+            const p = approxTotalEncrypted > 0 ? uploadedBytes / approxTotalEncrypted : 0
+            updateOptimisticState(pf.id, { status: 'uploading', progress: Math.min(p, 0.99), error: null })
+          }
+          emitProgress(index, 'uploading')
         }
-        emitProgress(index, 'uploading')
-      }, false)
 
-      // Retrieve sha256 and size
-      let sha256, size
-      if (uploadRes instanceof ArrayBuffer) {
-        const json = JSON.parse(new TextDecoder().decode(uploadRes))
-        sha256 = json.sha256
-        size = json.size
-      } else if (uploadRes && uploadRes.sha256) {
-        sha256 = uploadRes.sha256
-        size = uploadRes.size
+        perFileLoaded[index] = pf.file.size
       } else {
-        sha256 = await computeSha256Hex(pf.encrypted)
-        size = pf.encrypted.byteLength
+        // Call uploadEncryptedFile with commit = false to defer the Git commit
+        const uploadRes = await uploadEncryptedFile(pf.id, pf.encrypted, (e) => {
+          perFileLoaded[index] = e.loaded
+          // V3: update fine-grained upload progress
+          if (updateOptimisticState) {
+            const p = pf.encrypted.byteLength > 0 ? e.loaded / pf.encrypted.byteLength : 0
+            updateOptimisticState(pf.id, { status: 'uploading', progress: p, error: null })
+          }
+          emitProgress(index, 'uploading')
+        }, false)
+
+        // Retrieve sha256 and size
+        let sha256, size
+        if (uploadRes instanceof ArrayBuffer) {
+          const json = JSON.parse(new TextDecoder().decode(uploadRes))
+          sha256 = json.sha256
+          size = json.size
+        } else if (uploadRes && uploadRes.sha256) {
+          sha256 = uploadRes.sha256
+          size = uploadRes.size
+        } else {
+          sha256 = await computeSha256Hex(pf.encrypted)
+          size = pf.encrypted.byteLength
+        }
+
+        commitDescriptors[index] = { id: pf.id, sha256, size }
+        perFileLoaded[index] = pf.encrypted.byteLength
+
+        // Dequeue successfully uploaded file from IndexedDB background sync queue
+        await dequeueUpload(pf.id)
       }
-
-      commitDescriptors[index] = { id: pf.id, sha256, size }
-      perFileLoaded[index] = pf.encrypted.byteLength
-
-      // Dequeue successfully uploaded file from IndexedDB background sync queue
-      await dequeueUpload(pf.id)
     } catch (err) {
       // V3: mark error on the optimistic card
       if (markOptimisticError) markOptimisticError(pf.id, err.message)
@@ -332,16 +446,24 @@ export async function uploadMediaBatch(files, onBatchProgress, optimisticCallbac
 
     // 4. Update manifest locally
     const manifest = await loadManifest()
-    const newEntries = thumbEntries.map(({ pf, thumb_offset, thumb_length }) => ({
-      id: pf.id,
-      name: pf.file.name,
-      type: pf.meta.type,
-      date_taken: pf.meta.date_taken,
-      size: pf.file.size,
-      duration: pf.meta.duration,
-      thumb_offset,
-      thumb_length,
-    }))
+    const newEntries = thumbEntries.map(({ pf, thumb_offset, thumb_length }) => {
+      const entry = {
+        id: pf.id,
+        name: pf.file.name,
+        type: pf.meta.type,
+        date_taken: pf.meta.date_taken,
+        size: pf.file.size,
+        duration: pf.meta.duration,
+        thumb_offset,
+        thumb_length,
+      }
+      if (pf.isLarge) {
+        entry.chunked = true
+        entry.chunk_size = pf.chunkSize
+        entry.chunk_count = pf.chunkCount
+      }
+      return entry
+    })
 
     for (const entry of newEntries) {
       manifest.files.push(entry)
@@ -353,8 +475,10 @@ export async function uploadMediaBatch(files, onBatchProgress, optimisticCallbac
     const encryptedManifest = new Uint8Array(await encryptPackedCrypto(manifestCompressedBytes, getActiveKey()))
 
     // 6. Make ONE SINGLE Git commit on the worker to finalize the batch
-    const filesToCommitInBatch = succeededIndices.map((i) => commitDescriptors[i])
-    
+    const filesToCommitInBatch = succeededIndices
+      .map((i) => commitDescriptors[i])
+      .filter(Boolean)
+
     const commitPayload = {
       files: filesToCommitInBatch,
       manifestBytesBase64: bytesToBase64(encryptedManifest),

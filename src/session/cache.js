@@ -27,7 +27,7 @@
  * a "Clear cache" toggle in a future settings page.
  */
 import { openDB } from 'idb'
-import { clearOpfsBundle, getOpfsBundle, setOpfsBundle } from '../storage/opfsCache'
+import { clearOpfsBundle, getOpfsBundle, setOpfsBundle, clearOpfsMedia } from '../storage/opfsCache'
 
 const DB_NAME = 'vaultphotos-session'
 // Bump version to 3 — adds the thumbCache store.
@@ -158,6 +158,8 @@ export async function clearCache() {
   await (await db()).clear(STORE)
   // Clear OPFS bundle.
   await clearOpfsBundle()
+  // Phase 9 — clear decrypted full-resolution media files.
+  await clearOpfsMedia()
 }
 
 // ---------------------------------------------------------------------------

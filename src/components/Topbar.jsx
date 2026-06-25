@@ -2,6 +2,7 @@ import { useNavigate, useLocation } from 'react-router-dom'
 import { Lock, Upload, LayoutGrid } from 'lucide-react'
 import { clearActiveKey } from '../crypto/keyDerivation'
 import { clearCache } from '../session/cache'
+import { purgePrefetchCache } from '../hooks/usePrefetch'
 
 export function Topbar({ title = 'VaultPhotos' }) {
   const navigate = useNavigate()
@@ -11,6 +12,7 @@ export function Topbar({ title = 'VaultPhotos' }) {
   function handleLock() {
     clearActiveKey()
     void clearCache()
+    purgePrefetchCache()   // Phase 8 — revoke all prefetched object URLs
     navigate('/unlock', { replace: true })
   }
 

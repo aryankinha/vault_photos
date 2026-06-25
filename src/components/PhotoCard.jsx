@@ -1,5 +1,6 @@
 import { useNavigate } from 'react-router-dom'
 import { AlertTriangle, Lock, Play } from 'lucide-react'
+import { usePrefetch } from '../hooks/usePrefetch'
 
 /**
  * Single thumbnail tile. Reads its image bytes from the gallery's in-memory
@@ -10,9 +11,21 @@ import { AlertTriangle, Lock, Play } from 'lucide-react'
  *
  * V3: Accepts an optional `uploadState` prop to show an in-progress overlay:
  *   { status: 'encrypting' | 'uploading' | 'done' | 'error', progress: 0-1, error: string | null }
+ *
+ * Phase 8: On mouse-enter (desktop) or 200 ms long-press (mobile), the full
+ * media file is prefetched so the Viewer opens instantly.
+ * Pass `prefetchEntry` (the manifest entry with all metadata) separately from
+ * the possibly-optimistic `entry` to avoid triggering prefetch on in-progress
+ * uploads that don't yet have real storage slots.
  */
-export function PhotoCard({ entry, thumbUrl, onClick, uploadState, onRetry }) {
+export function PhotoCard({ entry, thumbUrl, onClick, uploadState, onRetry, prefetchEntry }) {
   const navigate = useNavigate()
+
+  // Phase 8 — prefetch the full media on hover / long-press.
+  // Only prefetch when we have a real (non-optimistic) entry and no upload
+  // is in progress (uploading entries don't have server-side data yet).
+  const prefetchTarget = prefetchEntry ?? (uploadState ? null : entry)
+  const { hoverProps, touchProps } = usePrefetch(prefetchTarget)
 
   function open() {
     if (onClick) onClick()
@@ -26,6 +39,8 @@ export function PhotoCard({ entry, thumbUrl, onClick, uploadState, onRetry }) {
       type="button"
       onClick={open}
       className="group relative block aspect-square w-full overflow-hidden rounded-lg bg-neutral-900 ring-1 ring-white/5"
+      {...hoverProps}
+      {...touchProps}
     >
       {/* Shimmer skeleton — visible while thumb is loading */}
       {!thumbUrl && (
