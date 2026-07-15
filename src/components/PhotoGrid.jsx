@@ -1,37 +1,40 @@
-import { useEffect, useMemo, useRef } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { groupByMonth } from '../utils/dateGroup'
 import { DateGroup } from './DateGroup'
 import { PhotoCard } from './PhotoCard'
 
-/**
- * Scrollable gallery grid. Builds object URLs for thumbnails once per thumbs
- * change and revokes the previous batch on the next pass to avoid leaks.
- *
- * V3: Accepts optional optimisticStates Map and onRetry callback for the
- * upload overlay rendered on optimistic entries (before HF confirms).
- */
+const visibilityCallbacks = new WeakMap()
+let sharedObserver = null
+
+function observeNearViewport(element, callback) {
+  if (typeof IntersectionObserver === 'undefined') {
+    Promise.resolve().then(() => callback(true))
+    return () => {}
+  }
+
+  if (!sharedObserver) {
+    sharedObserver = new IntersectionObserver((observations) => {
+      for (const observation of observations) {
+        visibilityCallbacks.get(observation.target)?.(observation.isIntersecting)
+      }
+    }, {
+      // Keep roughly three screens above and below alive. Object URLs outside
+      // this window are revoked so very large libraries do not exhaust memory.
+      rootMargin: '300% 0px',
+      threshold: 0,
+    })
+  }
+
+  visibilityCallbacks.set(element, callback)
+  sharedObserver.observe(element)
+  return () => {
+    visibilityCallbacks.delete(element)
+    sharedObserver?.unobserve(element)
+  }
+}
+
 export function PhotoGrid({ entries, thumbs, optimisticStates, onRetry }) {
   const groups = useMemo(() => groupByMonth(entries), [entries])
-
-  const thumbUrls = useMemo(() => {
-    const map = new Map()
-    for (const entry of entries) {
-      const blob = thumbs.get(entry.id)
-      if (blob) map.set(entry.id, URL.createObjectURL(blob))
-    }
-    return map
-  }, [thumbs, entries])
-
-  // Track the current URL set so we can revoke it when it changes or unmounts.
-  const previousUrls = useRef(new Map())
-  useEffect(() => {
-    const prev = previousUrls.current
-    previousUrls.current = thumbUrls
-    return () => {
-      for (const url of prev.values()) URL.revokeObjectURL(url)
-    }
-  }, [thumbUrls])
-
   if (entries.length === 0) return null
 
   return (
@@ -40,10 +43,10 @@ export function PhotoGrid({ entries, thumbs, optimisticStates, onRetry }) {
         <DateGroup key={group.key} label={group.label}>
           <div className="grid grid-cols-3 gap-1.5 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6">
             {group.entries.map((entry) => (
-              <PhotoCard
+              <LazyPhotoCard
                 key={entry.id}
                 entry={entry}
-                thumbUrl={thumbUrls.get(entry.id)}
+                thumbBlob={thumbs.get(entry.id)}
                 uploadState={optimisticStates?.get(entry.id)}
                 onRetry={onRetry}
               />
@@ -55,4 +58,46 @@ export function PhotoGrid({ entries, thumbs, optimisticStates, onRetry }) {
   )
 }
 
+function LazyPhotoCard({ entry, thumbBlob, uploadState, onRetry }) {
+  const containerRef = useRef(null)
+  const urlRef = useRef(null)
+  const [thumbUrl, setThumbUrl] = useState(null)
 
+  useEffect(() => {
+    const element = containerRef.current
+    if (!element) return undefined
+
+    const releaseUrl = () => {
+      if (!urlRef.current) return
+      URL.revokeObjectURL(urlRef.current)
+      urlRef.current = null
+      setThumbUrl(null)
+    }
+
+    const unobserve = observeNearViewport(element, (isNear) => {
+      if (isNear && thumbBlob && !urlRef.current) {
+        urlRef.current = URL.createObjectURL(thumbBlob)
+        setThumbUrl(urlRef.current)
+      } else if (!isNear) {
+        releaseUrl()
+      }
+    })
+
+    return () => {
+      unobserve()
+      if (urlRef.current) URL.revokeObjectURL(urlRef.current)
+      urlRef.current = null
+    }
+  }, [thumbBlob])
+
+  return (
+    <div ref={containerRef} className="aspect-square min-w-0">
+      <PhotoCard
+        entry={entry}
+        thumbUrl={thumbUrl}
+        uploadState={uploadState}
+        onRetry={onRetry}
+      />
+    </div>
+  )
+}

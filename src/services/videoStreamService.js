@@ -46,18 +46,16 @@ import * as worker from '../storage/workerClient'
  * isTypeSupported() is synchronous and cheap.
  */
 const MSE_PROBE_TYPES = [
+  'video/mp4',
   // fMP4 — H.264 baseline + AAC (widest support)
   'video/mp4; codecs="avc1.42E01E,mp4a.40.2"',
   // fMP4 — H.264 high + AAC
   'video/mp4; codecs="avc1.640028,mp4a.40.2"',
-  // fMP4 — generic (browser picks codec from container)
-  'video/mp4',
+  'video/webm',
   // WebM — VP9 + Opus (Chrome/Edge/Firefox)
   'video/webm; codecs="vp9,opus"',
   // WebM — VP8 + Vorbis
   'video/webm; codecs="vp8,vorbis"',
-  // WebM — generic
-  'video/webm',
 ]
 
 /**
@@ -99,28 +97,77 @@ export function createVideoStream(entry, mimeType, callbacks = {}) {
   const sourceBufferType = resolveSourceBufferType(mimeType)
   if (!sourceBufferType) return null
 
-  const { onProgress, onError } = callbacks
+  const { onProgress } = callbacks
   const mediaSource = new MediaSource()
   const url = URL.createObjectURL(mediaSource)
 
   let aborted = false
   let sourceBuffer = null
+  let settled = false
+  let resolveDone
+  let rejectDone
+  const done = new Promise((resolve, reject) => {
+    resolveDone = resolve
+    rejectDone = reject
+  })
 
   // ── Helper: wait for SourceBuffer to finish processing an appendBuffer ────
   function waitForUpdateEnd() {
     return new Promise((resolve, reject) => {
-      function onEnd() {
+      function cleanup() {
         sourceBuffer.removeEventListener('updateend', onEnd)
         sourceBuffer.removeEventListener('error', onErr)
+        sourceBuffer.removeEventListener('abort', onAbort)
+      }
+      function onEnd() {
+        cleanup()
         resolve()
       }
       function onErr(e) {
-        sourceBuffer.removeEventListener('updateend', onEnd)
-        sourceBuffer.removeEventListener('error', onErr)
+        cleanup()
         reject(new Error(`SourceBuffer error: ${e.type}`))
+      }
+      function onAbort() {
+        cleanup()
+        reject(new Error('SourceBuffer append aborted'))
       }
       sourceBuffer.addEventListener('updateend', onEnd)
       sourceBuffer.addEventListener('error', onErr)
+      sourceBuffer.addEventListener('abort', onAbort)
+    })
+  }
+
+  function appendBuffer(buffer) {
+    return new Promise((resolve, reject) => {
+      const cleanup = () => {
+        sourceBuffer.removeEventListener('updateend', onEnd)
+        sourceBuffer.removeEventListener('error', onError)
+        sourceBuffer.removeEventListener('abort', onAbort)
+      }
+      const onEnd = () => {
+        cleanup()
+        resolve()
+      }
+      const onError = (event) => {
+        cleanup()
+        reject(new Error(`SourceBuffer error: ${event.type}`))
+      }
+      const onAbort = () => {
+        cleanup()
+        reject(new Error('SourceBuffer append aborted'))
+      }
+
+      sourceBuffer.addEventListener('updateend', onEnd)
+      sourceBuffer.addEventListener('error', onError)
+      sourceBuffer.addEventListener('abort', onAbort)
+      try {
+        sourceBuffer.appendBuffer(buffer)
+      } catch (error) {
+        cleanup()
+        reject(new Error(`Unable to append video segment: ${error.name}`, {
+          cause: error,
+        }))
+      }
     })
   }
 
@@ -128,15 +175,12 @@ export function createVideoStream(entry, mimeType, callbacks = {}) {
   async function stream() {
     try {
       sourceBuffer = mediaSource.addSourceBuffer(sourceBufferType)
-      // 'sequence' mode: browser assigns presentation timestamps in order,
-      // which is correct for sequentially decrypted chunks.
-      sourceBuffer.mode = 'sequence'
     } catch (err) {
       // addSourceBuffer can throw if the type was accepted by isTypeSupported
       // but the actual data format is wrong (e.g. non-fragmented MP4).
-      console.warn('[Phase 10] addSourceBuffer failed:', err.message)
       if (mediaSource.readyState === 'open') mediaSource.endOfStream('decode')
-      onError?.(err)
+      settled = true
+      rejectDone(err)
       return
     }
 
@@ -156,23 +200,25 @@ export function createVideoStream(entry, mimeType, callbacks = {}) {
         if (sourceBuffer.updating) await waitForUpdateEnd()
         if (aborted) break
 
-        sourceBuffer.appendBuffer(decryptedChunk)
-        await waitForUpdateEnd()
+        await appendBuffer(decryptedChunk)
 
         done++
         onProgress?.(done / total)
       }
     } catch (err) {
       if (!aborted) {
-        console.warn('[Phase 10] Streaming error:', err.message)
-        onError?.(err)
+        settled = true
+        rejectDone(err)
       }
+      return
     }
 
     if (!aborted && mediaSource.readyState === 'open') {
       // Ensure no pending update before calling endOfStream
       if (sourceBuffer?.updating) await waitForUpdateEnd().catch(() => {})
       try { mediaSource.endOfStream() } catch { /* already ended or aborted */ }
+      settled = true
+      resolveDone()
     }
   }
 
@@ -183,6 +229,10 @@ export function createVideoStream(entry, mimeType, callbacks = {}) {
   // ── Cleanup — abort in-flight streaming and revoke URL ────────────────────
   function cleanup() {
     aborted = true
+    if (!settled) {
+      settled = true
+      rejectDone(new Error('Video stream cancelled'))
+    }
     // Abort any pending SourceBuffer operation so the coroutine unblocks.
     try {
       if (sourceBuffer && mediaSource.readyState === 'open' && sourceBuffer.updating) {
@@ -196,7 +246,7 @@ export function createVideoStream(entry, mimeType, callbacks = {}) {
     URL.revokeObjectURL(url)
   }
 
-  return { url, cleanup }
+  return { url, done, cleanup }
 }
 
 /**

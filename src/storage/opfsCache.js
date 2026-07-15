@@ -1,238 +1,171 @@
 /**
- * opfsCache.js — Origin Private File System cache for decrypted vault data.
+ * Origin Private File System caches.
  *
- * OPFS is a browser-native private file system that provides:
- *   - Significantly faster reads/writes for large binary blobs vs. IndexedDB
- *   - No practical storage size limit (vs. IDB quota)
- *   - Byte-level file access without serialisation overhead
- *   - Origin isolation (completely private to this app)
- *
- * Security: stores DECRYPTED bytes — same security level as the IDB cache.
- * The AES key is NEVER stored here. All files are wiped on vault lock
- * (clearOpfsBundle is called from cache.clearCache).
- *
- * Availability: Chrome 86+, Firefox 111+, Safari 15.2+.
- * Falls back gracefully to returning null / no-op on unsupported browsers.
- *
- * File layout (all under the OPFS root):
- *   thumbs.bundle.dec       — decrypted bundle binary (all thumbnails concatenated)
- *   media/<id>.dec          — decrypted full-resolution media file, keyed by entry id
+ * The thumbnail bundle cache is decrypted session data and is cleared on lock
+ * and at application startup. Full-resolution files are persisted only in
+ * their encrypted HF wire format under files/<id>.enc, then decrypted with the
+ * in-RAM key on each read.
  */
+
+import { decryptPacked } from '../crypto/decrypt'
 
 const BUNDLE_FILENAME = 'thumbs.bundle.dec'
-const MEDIA_DIR = 'media'
+const FILES_DIR = 'files'
+const LEGACY_PLAINTEXT_DIR = 'media'
+const MEDIA_ID_PATTERN = /^[0-9a-f]{16}$/i
 
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
+let legacyCleanupPromise = null
 
-/**
- * Return the OPFS root DirectoryHandle, or null if unsupported / denied.
- * Result is NOT cached — each call to the public API gets a fresh handle.
- * (getDirectory() is synchronous after the first call on most implementations.)
- *
- * @returns {Promise<FileSystemDirectoryHandle|null>}
- */
 async function getRoot() {
   try {
     if (typeof navigator === 'undefined') return null
     if (typeof navigator.storage?.getDirectory !== 'function') return null
-    return await navigator.storage.getDirectory()
-  } catch {
-    // Permission denied, private-mode Firefox, or unsupported — silent fail.
-    return null
-  }
-}
+    const root = await navigator.storage.getDirectory()
 
-/**
- * Return (or create) the media/ subdirectory under the OPFS root.
- *
- * @returns {Promise<FileSystemDirectoryHandle|null>}
- */
-async function getMediaDir() {
-  const root = await getRoot()
-  if (!root) return null
-  try {
-    return await root.getDirectoryHandle(MEDIA_DIR, { create: true })
+    // Earlier V3 builds wrote plaintext media/<id>.dec files. Remove that
+    // directory once per page lifetime before exposing the corrected cache.
+    if (!legacyCleanupPromise) {
+      legacyCleanupPromise = root
+        .removeEntry(LEGACY_PLAINTEXT_DIR, { recursive: true })
+        .catch(() => {})
+    }
+    await legacyCleanupPromise
+    return root
   } catch {
     return null
   }
 }
 
-/**
- * Normalise input to an ArrayBuffer ready to write.
- * Handles both ArrayBuffer and Uint8Array (including non-zero-offset views).
- *
- * @param {ArrayBuffer|Uint8Array} bytes
- * @returns {ArrayBuffer}
- */
+function validateId(id) {
+  if (!MEDIA_ID_PATTERN.test(id)) throw new Error('Invalid media id')
+}
+
 function toArrayBuffer(bytes) {
   if (bytes instanceof ArrayBuffer) return bytes
-  // Uint8Array with non-zero byteOffset needs a slice to get a clean buffer.
-  if (bytes.byteOffset !== 0 || bytes.byteLength !== bytes.buffer.byteLength) {
+  if (ArrayBuffer.isView(bytes)) {
     return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)
   }
-  return bytes.buffer
+  throw new TypeError('Expected an ArrayBuffer or typed array')
 }
 
-// ---------------------------------------------------------------------------
-// Bundle API (unchanged — backward compatible with existing callers)
-// ---------------------------------------------------------------------------
-
-/**
- * Read the decrypted bundle from OPFS.
- *
- * @returns {Promise<ArrayBuffer|null>} — bundle bytes, or null on miss/error
- */
 export async function getOpfsBundle() {
   const root = await getRoot()
   if (!root) return null
   try {
-    const fh = await root.getFileHandle(BUNDLE_FILENAME)
-    const file = await fh.getFile()
-    return await file.arrayBuffer()
+    const handle = await root.getFileHandle(BUNDLE_FILENAME)
+    return (await handle.getFile()).arrayBuffer()
   } catch {
-    // File not found (first run) or read error — treated as cache miss.
     return null
   }
 }
 
-/**
- * Write decrypted bundle bytes to OPFS.
- *
- * @param {ArrayBuffer|Uint8Array} bytes
- * @returns {Promise<boolean>} — true if write succeeded, false otherwise
- */
 export async function setOpfsBundle(bytes) {
   const root = await getRoot()
   if (!root) return false
-  let writable = null
+  let writable
   try {
-    const fh = await root.getFileHandle(BUNDLE_FILENAME, { create: true })
-    writable = await fh.createWritable()
+    const handle = await root.getFileHandle(BUNDLE_FILENAME, { create: true })
+    writable = await handle.createWritable()
     await writable.write(toArrayBuffer(bytes))
     await writable.close()
-    writable = null // already closed
     return true
   } catch {
-    // Close without committing if write failed mid-way.
-    if (writable) {
-      try { await writable.abort() } catch { /* ignore */ }
-    }
+    try { await writable?.abort() } catch { /* best effort */ }
     return false
   }
 }
 
-/**
- * Delete the bundle file from OPFS (called on vault lock).
- *
- * @returns {Promise<void>}
- */
 export async function clearOpfsBundle() {
   const root = await getRoot()
   if (!root) return
-  try {
-    await root.removeEntry(BUNDLE_FILENAME)
-  } catch {
-    // File may not exist yet — not an error.
-  }
+  try { await root.removeEntry(BUNDLE_FILENAME) } catch { /* cache miss */ }
 }
 
-// ---------------------------------------------------------------------------
-// Phase 9 — Full media file cache (media/<id>.dec)
-// ---------------------------------------------------------------------------
-
-/**
- * Read a cached decrypted media file from OPFS.
- *
- * @param {string} id — 16-hex entry id
- * @returns {Promise<ArrayBuffer|null>} — decrypted bytes, or null on cache miss
- */
-export async function getOpfsMedia(id) {
-  const dir = await getMediaDir()
-  if (!dir) return null
-  try {
-    const fh = await dir.getFileHandle(`${id}.dec`)
-    const file = await fh.getFile()
-    return await file.arrayBuffer()
-  } catch {
-    return null
-  }
+export async function isOPFSSupported() {
+  return Boolean(await getRoot())
 }
 
-/**
- * Write a decrypted media file to OPFS.
- * Fire-and-forget safe — callers should not await this in the hot path.
- *
- * @param {string} id — 16-hex entry id
- * @param {ArrayBuffer|Uint8Array} bytes — decrypted plaintext
- * @returns {Promise<boolean>} — true if write succeeded
- */
-export async function setOpfsMedia(id, bytes) {
-  const dir = await getMediaDir()
-  if (!dir) return false
-  let writable = null
-  try {
-    const fh = await dir.getFileHandle(`${id}.dec`, { create: true })
-    writable = await fh.createWritable()
-    await writable.write(toArrayBuffer(bytes))
-    await writable.close()
-    writable = null
-    return true
-  } catch {
-    if (writable) {
-      try { await writable.abort() } catch { /* ignore */ }
-    }
-    return false
-  }
-}
-
-/**
- * Delete a single media file from OPFS.
- * Called when an entry is removed from the vault.
- *
- * @param {string} id
- * @returns {Promise<void>}
- */
-export async function deleteOpfsMedia(id) {
-  const dir = await getMediaDir()
-  if (!dir) return
-  try {
-    await dir.removeEntry(`${id}.dec`)
-  } catch {
-    // Missing file is not an error.
-  }
-}
-
-/**
- * Wipe the entire media/ directory from OPFS.
- * Called on vault lock — ensures no decrypted bytes persist after lock.
- *
- * @returns {Promise<void>}
- */
-export async function clearOpfsMedia() {
-  const root = await getRoot()
-  if (!root) return
-  try {
-    await root.removeEntry(MEDIA_DIR, { recursive: true })
-  } catch {
-    // Directory may not exist yet on first lock — not an error.
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Feature detection
-// ---------------------------------------------------------------------------
-
-/**
- * Returns true if OPFS is available in the current browser/context.
- * Useful for UI feature detection without actually reading files.
- *
- * @returns {boolean}
- */
 export function isOpfsSupported() {
   return (
     typeof navigator !== 'undefined' &&
     typeof navigator.storage?.getDirectory === 'function'
   )
+}
+
+/**
+ * Return decrypted bytes from an encrypted OPFS cache entry, or null on miss.
+ * Authentication failures are allowed to throw so callers can discard the
+ * corrupt entry and retry the trusted network copy.
+ */
+export async function getCachedFile(id, key) {
+  validateId(id)
+  const root = await getRoot()
+  if (!root) return null
+
+  try {
+    const directory = await root.getDirectoryHandle(FILES_DIR)
+    const handle = await directory.getFileHandle(`${id}.enc`)
+    const encrypted = await (await handle.getFile()).arrayBuffer()
+    return decryptPacked(encrypted, key)
+  } catch (error) {
+    if (error?.name === 'NotFoundError') return null
+    throw error
+  }
+}
+
+export async function setCachedFile(id, encryptedBytes) {
+  validateId(id)
+  const root = await getRoot()
+  if (!root) return false
+  let writable
+
+  try {
+    const directory = await root.getDirectoryHandle(FILES_DIR, { create: true })
+    const handle = await directory.getFileHandle(`${id}.enc`, { create: true })
+    writable = await handle.createWritable()
+    await writable.write(toArrayBuffer(encryptedBytes))
+    await writable.close()
+    return true
+  } catch {
+    try { await writable?.abort() } catch { /* best effort */ }
+    return false
+  }
+}
+
+export async function deleteCachedFile(id) {
+  validateId(id)
+  const root = await getRoot()
+  if (!root) return
+  try {
+    const directory = await root.getDirectoryHandle(FILES_DIR)
+    await directory.removeEntry(`${id}.enc`)
+  } catch { /* cache miss */ }
+}
+
+export async function clearOPFSCache() {
+  const root = await getRoot()
+  if (!root) return
+  try {
+    await root.removeEntry(FILES_DIR, { recursive: true })
+  } catch { /* cache already empty */ }
+}
+
+export async function getOPFSCacheStats() {
+  const root = await getRoot()
+  if (!root) return { count: 0, totalBytes: 0 }
+
+  try {
+    const directory = await root.getDirectoryHandle(FILES_DIR)
+    let count = 0
+    let totalBytes = 0
+    for await (const [, handle] of directory.entries()) {
+      if (handle.kind !== 'file') continue
+      const file = await handle.getFile()
+      count += 1
+      totalBytes += file.size
+    }
+    return { count, totalBytes }
+  } catch {
+    return { count: 0, totalBytes: 0 }
+  }
 }

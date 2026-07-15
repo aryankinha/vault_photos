@@ -1,211 +1,169 @@
 /**
- * cryptoWorkerPool.js — Pool of crypto Web Workers.
- *
- * Maintains up to POOL_SIZE parallel workers and distributes encrypt/decrypt
- * jobs across them using a simple round-robin dispatcher. Each job is
- * identified by a unique id so out-of-order completions (via Transferable
- * zero-copy postMessage) resolve to the correct Promise.
- *
- * Usage:
- *   import { encryptWithPool, decryptWithPool, shutdownPool } from './cryptoWorkerPool'
- *
- *   const encrypted = await encryptWithPool(arrayBuffer, cryptoKey)
- *   const decrypted = await decryptWithPool(encryptedBuffer, cryptoKey)
- *
- * The pool is lazily initialised on first use and reused for the lifetime
- * of the JS module. Call shutdownPool() only if you need to free the threads
- * explicitly (e.g., in tests).
- *
- * Transferable contract:
- *   Input ArrayBuffer is transferred to the worker (ownership moves, zero-copy).
- *   The caller MUST NOT use the input buffer after calling these functions.
- *   The returned ArrayBuffer is a new buffer owned by the caller.
+ * Small FIFO pool of Vite module workers for large transferable media tasks.
+ * A transferred ArrayBuffer is detached in the sender immediately, so tasks
+ * are never retried with the same buffer after dispatch.
  */
 
-import CryptoWorker from './cryptoWorker.js?worker'
+const POOL_SIZE = Math.min(
+  typeof navigator === 'undefined' ? 1 : (navigator.hardwareConcurrency || 4),
+  4,
+)
 
-// Number of parallel worker threads. navigator.hardwareConcurrency is capped
-// at 4 to avoid saturating mobile devices.
-const POOL_SIZE = Math.min(typeof navigator !== 'undefined' ? (navigator.hardwareConcurrency || 2) : 2, 4)
+let slots = []
+let queue = []
+let nextTaskId = 0
+let terminated = false
 
-// ---------------------------------------------------------------------------
-// Pool state
-// ---------------------------------------------------------------------------
+function createWorkerSlot() {
+  const worker = new Worker(new URL('./cryptoWorker.js', import.meta.url), {
+    type: 'module',
+  })
+  const slot = { worker, busy: false, task: null }
 
-/** @type {Worker[]} */
-let workers = []
+  worker.onmessage = (event) => {
+    const task = slot.task
+    if (!task || event.data.taskId !== task.taskId) return
 
-/** @type {Map<string, { resolve: (buf: ArrayBuffer) => void, reject: (err: Error) => void }>} */
-const pending = new Map()
+    slot.busy = false
+    slot.task = null
 
-let nextWorkerIndex = 0
-let poolInitialised = false
+    if (event.data.type === 'result') {
+      task.resolve(event.data.result)
+    } else {
+      task.reject(new Error(event.data.message || 'Crypto worker task failed'))
+    }
+    pumpQueue()
+  }
 
-// ---------------------------------------------------------------------------
-// Initialisation
-// ---------------------------------------------------------------------------
+  worker.onerror = (event) => {
+    const task = slot.task
+    if (task) {
+      task.reject(new Error(event.message || 'Crypto worker crashed'))
+    }
+
+    worker.terminate()
+    slot.busy = false
+    slot.task = null
+
+    if (!terminated) {
+      const index = slots.indexOf(slot)
+      if (index !== -1) slots[index] = createWorkerSlot()
+      pumpQueue()
+    }
+  }
+
+  return slot
+}
 
 function ensurePool() {
-  if (poolInitialised) return
-  poolInitialised = true
+  if (typeof Worker === 'undefined') return false
+  if (slots.length > 0) return true
 
-  for (let i = 0; i < POOL_SIZE; i++) {
-    const w = new CryptoWorker()
-    w.onmessage = handleWorkerMessage
-    w.onerror = handleWorkerError
-    workers.push(w)
+  terminated = false
+  for (let index = 0; index < POOL_SIZE; index += 1) {
+    slots.push(createWorkerSlot())
+  }
+  return true
+}
+
+function pumpQueue() {
+  if (terminated) return
+
+  for (const slot of slots) {
+    if (slot.busy || queue.length === 0) continue
+    const task = queue.shift()
+    slot.busy = true
+    slot.task = task
+
+    const message = {
+      operation: task.operation,
+      taskId: task.taskId,
+      buffer: task.buffer,
+      key: task.key,
+      ...task.options,
+    }
+
+    try {
+      slot.worker.postMessage(message, [task.buffer])
+    } catch (error) {
+      slot.busy = false
+      slot.task = null
+      task.reject(error)
+      queueMicrotask(pumpQueue)
+    }
   }
 }
 
-function handleWorkerMessage(event) {
-  const { type, id, result, message } = event.data
-  const handler = pending.get(id)
-  if (!handler) return // stale message — ignore
-
-  pending.delete(id)
-
-  if (type === 'result') {
-    handler.resolve(result)
-  } else {
-    handler.reject(new Error(message || 'Crypto worker error'))
-  }
-}
-
-function handleWorkerError(event) {
-  // A worker-level error (script exception before postMessage). We can't
-  // know which job it belongs to — reject all pending jobs and reinitialise.
-  console.error('[CryptoWorkerPool] Worker error:', event.message)
-  const err = new Error(`Crypto worker crashed: ${event.message}`)
-  for (const handler of pending.values()) {
-    handler.reject(err)
-  }
-  pending.clear()
-  // Reinitialise the pool so future calls aren't broken.
-  poolInitialised = false
-  workers = []
-}
-
-// ---------------------------------------------------------------------------
-// Job dispatch
-// ---------------------------------------------------------------------------
-
-let jobCounter = 0
-
-/**
- * JWK representation of the raw key, computed once.
- * @type {JsonWebKey|null}
- */
-let cachedKeyJwk = null
-
-/**
- * Register the raw AES-256 key material so the worker pool can use it.
- * Must be called immediately after key derivation, before any pool operations.
- *
- * @param {Uint8Array} rawKey — 32 raw key bytes from Argon2id hash output
- */
-export function setPoolKey(rawKey) {
-  // Build the JWK eagerly so workers don't have to do it per-job.
-  cachedKeyJwk = {
-    kty: 'oct',
-    k: uint8ToBase64Url(rawKey),
-    alg: 'A256GCM',
-    key_ops: ['encrypt', 'decrypt'],
-    ext: true,
-  }
-}
-
-/**
- * Clear the pool's copy of the key (call on vault lock).
- */
-export function clearPoolKey() {
-  cachedKeyJwk = null
-}
-
-/**
- * Dispatch a job to the next available worker.
- * @param {'encrypt'|'decrypt'} type
- * @param {ArrayBuffer} payload — ownership transferred to worker
- * @returns {Promise<ArrayBuffer>}
- */
-function dispatch(type, payload) {
-  if (!cachedKeyJwk) {
-    throw new Error('CryptoWorkerPool: no key set — call setPoolKey() first')
+function dispatch(operation, input, key, options = {}) {
+  if (!ensurePool()) {
+    return Promise.reject(new Error('Web Workers are unavailable'))
   }
 
-  ensurePool()
-
-  const id = `job_${++jobCounter}`
+  const buffer = ownArrayBuffer(input)
+  const taskId = `crypto_${++nextTaskId}`
 
   return new Promise((resolve, reject) => {
-    pending.set(id, { resolve, reject })
-
-    const workerIndex = nextWorkerIndex % workers.length
-    nextWorkerIndex = (nextWorkerIndex + 1) % workers.length
-
-    const worker = workers[workerIndex]
-    // Transfer payload buffer to worker (zero-copy).
-    worker.postMessage({ type, id, payload, keyData: cachedKeyJwk }, [payload])
+    queue.push({ operation, taskId, buffer, key, options, resolve, reject })
+    pumpQueue()
   })
 }
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
-/**
- * Encrypt an ArrayBuffer off the main thread.
- * The input buffer is transferred — do not use it after this call.
- *
- * @param {ArrayBuffer} buffer — plaintext
- * @returns {Promise<ArrayBuffer>} — [12-byte nonce | ciphertext+tag]
- */
-export async function encryptWithPool(buffer) {
-  return dispatch('encrypt', buffer instanceof ArrayBuffer ? buffer : buffer.buffer)
+export function isCryptoPoolSupported() {
+  return typeof Worker !== 'undefined'
 }
 
-/**
- * Decrypt a packed [nonce|ct+tag] ArrayBuffer off the main thread.
- * The input buffer is transferred — do not use it after this call.
- *
- * @param {ArrayBuffer} buffer — packed encrypted payload
- * @returns {Promise<ArrayBuffer>} — plaintext
- */
-export async function decryptWithPool(buffer) {
-  return dispatch('decrypt', buffer instanceof ArrayBuffer ? buffer : buffer.buffer)
+export function encryptWithPool(buffer, key) {
+  return dispatch('encrypt', buffer, key)
 }
 
-/**
- * Terminate all workers and reset the pool.
- * After calling this, the pool will reinitialise on next use.
- */
+export function decryptWithPool(buffer, key) {
+  return dispatch('decrypt', buffer, key)
+}
+
+export function encryptChunkWithPool(buffer, key, index) {
+  return dispatch('encryptChunk', buffer, key, { index })
+}
+
+export function decryptChunkWithPool(buffer, key, index) {
+  return dispatch('decryptChunk', buffer, key, { index })
+}
+
+export function thumbnailWithPool(buffer, mediaType, filename) {
+  return dispatch('thumbnail', buffer, null, { mediaType, filename })
+}
+
+export function exifWithPool(buffer) {
+  return dispatch('exif', buffer, null)
+}
+
 export function shutdownPool() {
-  for (const w of workers) w.terminate()
-  workers = []
-  pending.clear()
-  poolInitialised = false
-  nextWorkerIndex = 0
+  terminated = true
+  const error = new Error('Crypto worker pool terminated')
+
+  for (const task of queue) task.reject(error)
+  queue = []
+
+  for (const slot of slots) {
+    if (slot.task) slot.task.reject(error)
+    slot.worker.terminate()
+  }
+  slots = []
 }
 
-/**
- * Singleton pool instance — import this to call terminate() on vault lock.
- */
 export const cryptoPool = {
   terminate: shutdownPool,
+  encrypt: encryptWithPool,
+  decrypt: decryptWithPool,
+  encryptChunk: encryptChunkWithPool,
+  decryptChunk: decryptChunkWithPool,
+  thumbnail: thumbnailWithPool,
+  exif: exifWithPool,
 }
 
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Encode a Uint8Array as a Base64URL string (no padding).
- * Used to build the JWK 'k' field.
- */
-function uint8ToBase64Url(bytes) {
-  let binary = ''
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i])
+function ownArrayBuffer(input) {
+  if (input instanceof ArrayBuffer) return input
+  if (ArrayBuffer.isView(input)) {
+    return input.buffer.slice(input.byteOffset, input.byteOffset + input.byteLength)
   }
-  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '')
+  throw new TypeError('Worker tasks require an ArrayBuffer or typed array')
 }

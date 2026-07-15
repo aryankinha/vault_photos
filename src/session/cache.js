@@ -27,7 +27,7 @@
  * a "Clear cache" toggle in a future settings page.
  */
 import { openDB } from 'idb'
-import { clearOpfsBundle, getOpfsBundle, setOpfsBundle, clearOpfsMedia } from '../storage/opfsCache'
+import { clearOpfsBundle, getOpfsBundle, setOpfsBundle } from '../storage/opfsCache'
 
 const DB_NAME = 'vaultphotos-session'
 // Bump version to 3 — adds the thumbCache store.
@@ -36,6 +36,7 @@ const DB_VERSION = 3
 const STORE = 'kv'
 const MANIFEST_KEY = 'manifest'
 const BUNDLE_KEY = 'bundle'
+const WORKER_URL_KEY = 'workerUrl'
 const QUEUE_STORE = 'uploadQueue'
 const THUMB_CACHE_STORE = 'thumbCache'
 
@@ -91,6 +92,10 @@ export async function getManifestCache() {
 
 export async function setManifestCache(bytes) {
   await (await db()).put(STORE, bytes, MANIFEST_KEY)
+}
+
+export async function setWorkerUrl(url) {
+  await (await db()).put(STORE, url, WORKER_URL_KEY)
 }
 
 // ---------------------------------------------------------------------------
@@ -154,12 +159,13 @@ export async function setBundleCache(bytes) {
  * Does NOT clear thumbCache — see security note in module header.
  */
 export async function clearCache() {
-  // Clear IDB kv store (manifest + any legacy bundle entry).
-  await (await db()).clear(STORE)
+  // Clear decrypted IDB entries while preserving the non-secret Worker URL
+  // needed by Background Sync after a tab closes or a new document starts.
+  const database = await db()
+  await database.delete(STORE, MANIFEST_KEY)
+  await database.delete(STORE, BUNDLE_KEY)
   // Clear OPFS bundle.
   await clearOpfsBundle()
-  // Phase 9 — clear decrypted full-resolution media files.
-  await clearOpfsMedia()
 }
 
 // ---------------------------------------------------------------------------
@@ -173,6 +179,10 @@ export async function clearCache() {
  * @returns {Promise<Blob|null>}
  */
 export async function getCachedThumb(id) {
+  // Decrypted thumbnails are stored in IndexedDB across sessions.
+  // This is intentional for personal device UX — thumbnails are low-resolution
+  // previews and the device itself is trusted. Full-resolution files are never
+  // cached in plaintext. Use clearThumbCache() to remove these previews.
   const row = await (await db()).get(THUMB_CACHE_STORE, id)
   return row ? row.blob : null
 }
@@ -250,9 +260,10 @@ export async function getThumbCacheStats() {
  * @param {string} id — 16-hex file id
  * @param {Uint8Array} encryptedBytes
  * @param {object} entry — manifest entry object (without thumb_offset/thumb_length yet)
+ * @param {Blob} [thumbnail] — small recovery copy if the persistent thumb cache is unavailable
  */
-export async function queueUpload(id, encryptedBytes, entry) {
-  await (await db()).put(QUEUE_STORE, { id, encryptedBytes, entry })
+export async function queueUpload(id, encryptedBytes, entry, thumbnail) {
+  await (await db()).put(QUEUE_STORE, { id, encryptedBytes, entry, thumbnail })
 }
 
 /**
@@ -271,3 +282,21 @@ export async function getUploadQueue() {
   return (await db()).getAll(QUEUE_STORE)
 }
 
+export async function markQueuedUploadUploaded(id, uploaded) {
+  const database = await db()
+  const row = await database.get(QUEUE_STORE, id)
+  if (!row) return
+  await database.put(QUEUE_STORE, { ...row, uploaded })
+}
+
+export async function registerUploadSync() {
+  try {
+    if (!('serviceWorker' in navigator)) return false
+    const registration = await navigator.serviceWorker.ready
+    if (!registration.sync) return false
+    await registration.sync.register('vault-upload-queue')
+    return true
+  } catch {
+    return false
+  }
+}

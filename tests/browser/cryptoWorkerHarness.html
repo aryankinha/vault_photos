@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>VaultPhotos crypto worker test</title>
+    <style>
+      body { margin: 2rem; background: #0a0a0a; color: #fafafa; font: 14px system-ui; }
+      .indicator { width: 24px; height: 24px; margin-bottom: 1rem; border: 3px solid #38bdf8; border-right-color: transparent; border-radius: 50%; animation: spin .7s linear infinite; }
+      pre { white-space: pre-wrap; color: #a3a3a3; }
+      @keyframes spin { to { transform: rotate(360deg); } }
+    </style>
+  </head>
+  <body>
+    <div class="indicator" aria-hidden="true"></div>
+    <h1>Crypto worker verification</h1>
+    <pre id="result" role="status">Running 50 MB round trip...</pre>
+    <script type="module" src="./cryptoWorkerHarness.js"></script>
+  </body>
+</html>

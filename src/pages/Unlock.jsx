@@ -2,10 +2,16 @@ import { useCallback, useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { ShieldCheck, Loader2, AlertTriangle } from 'lucide-react'
 import { unlockWithPassphrase } from '../crypto/keyDerivation'
-import { getSalt, uploadSalt } from '../storage/workerClient'
+import { clearActiveKey } from '../crypto/keyDerivation'
+import { getSalt, initializeVault } from '../storage/workerClient'
 import { decryptPacked } from '../crypto/decrypt'
+import { encryptPacked } from '../crypto/encrypt'
 import { getManifest } from '../storage/workerClient'
 import { clearCache } from '../session/cache'
+import { createEmptyManifest } from '../schema/manifestSchema'
+import { createEmptyBundle } from '../schema/bundleSchema'
+import { parseManifestBytes, serializeManifestCompressed } from '../storage/manifest'
+import { getUserErrorMessage, UserFacingError } from '../utils/errors'
 
 export function Unlock() {
   const navigate = useNavigate()
@@ -14,24 +20,31 @@ export function Unlock() {
   const [confirm, setConfirm] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState(null)
+  const [probeKey, setProbeKey] = useState(0)
 
   // On mount, probe the worker for a salt. Missing salt = first run (create mode).
   useEffect(() => {
     let cancelled = false
-    ;(async () => {
+    Promise.resolve().then(async () => {
+      if (cancelled) return
+      setMode('checking')
+      setError(null)
       try {
         await getSalt()
         if (!cancelled) setMode('unlock')
       } catch (e) {
         if (cancelled) return
         if (e.status === 404) setMode('create')
-        else setError(e)
+        else {
+          setMode('error')
+          setError(getUserErrorMessage(e, 'Unable to reach your vault. Check your connection and try again.'))
+        }
       }
-    })()
+    })
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [probeKey])
 
   const handleSubmit = useCallback(
     async (event) => {
@@ -43,14 +56,14 @@ export function Unlock() {
       try {
         if (mode === 'create') {
           if (passphrase.length < 8) {
-            throw new Error('Passphrase must be at least 8 characters')
+            throw new UserFacingError('Passphrase must be at least 8 characters')
           }
           if (passphrase !== confirm) {
-            throw new Error('Passphrases do not match')
+            throw new UserFacingError('Passphrases do not match')
           }
           const salt = crypto.getRandomValues(new Uint8Array(16))
-          await uploadSalt(salt)
-          await unlockWithPassphrase(passphrase, salt)
+          const key = await unlockWithPassphrase(passphrase, salt)
+          await initializeEncryptedVault(salt, key)
           // Fresh vault — clear any stale cache from a prior session.
           await clearCache()
           navigate('/gallery', { replace: true })
@@ -60,16 +73,30 @@ export function Unlock() {
         // Unlock mode: fetch salt, derive key, verify against the manifest.
         const salt = await getSalt()
         const key = await unlockWithPassphrase(passphrase, salt)
-        // Confirm the passphrase is correct by decrypting something real.
+        let manifestBytes
         try {
-          const manifestBytes = await getManifest()
-          await decryptPacked(manifestBytes, key)
+          manifestBytes = await getManifest()
+        } catch (networkError) {
+          if (networkError.status === 404) {
+            // Repair a salt-only vault left by an interrupted older setup.
+            await initializeEncryptedVault(salt, key)
+            navigate('/gallery', { replace: true })
+            return
+          }
+          throw networkError
+        }
+
+        let decrypted
+        try {
+          decrypted = await decryptPacked(manifestBytes, key)
         } catch {
           throw new WrongPassphraseError()
         }
+        await parseManifestBytes(decrypted)
         navigate('/gallery', { replace: true })
       } catch (e) {
-        setError(e)
+        clearActiveKey()
+        setError(getUserErrorMessage(e, 'Unable to unlock the vault. Check your connection and try again.'))
       } finally {
         setBusy(false)
       }
@@ -90,13 +117,15 @@ export function Unlock() {
           <p className="mt-1 text-xs text-neutral-400">
             {mode === 'checking'
               ? 'Checking vault…'
+              : mode === 'error'
+                ? 'Unable to reach your encrypted storage'
               : isCreate
                 ? 'Create a passphrase to encrypt your vault'
                 : 'Enter your passphrase to unlock'}
           </p>
         </div>
 
-        {mode !== 'checking' && (
+        {(mode === 'create' || mode === 'unlock') && (
           <form
             onSubmit={handleSubmit}
             className="space-y-3 rounded-2xl border border-white/10 bg-neutral-900/60 p-5"
@@ -124,7 +153,7 @@ export function Unlock() {
             {error && (
               <div className="flex items-start gap-2 rounded-lg bg-red-500/10 p-2 text-xs text-red-300">
                 <AlertTriangle size={14} className="mt-0.5 shrink-0" />
-                <span className="break-words">{error.message}</span>
+                <span className="break-words">{error}</span>
               </div>
             )}
 
@@ -145,6 +174,22 @@ export function Unlock() {
           </div>
         )}
 
+        {mode === 'error' && (
+          <div className="rounded-xl border border-red-500/20 bg-red-500/10 p-4 text-center">
+            <div className="flex items-start justify-center gap-2 text-xs text-red-300">
+              <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+              <span className="break-words">{error}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setProbeKey((value) => value + 1)}
+              className="mt-3 rounded-lg bg-white/10 px-3 py-2 text-xs font-semibold text-white hover:bg-white/15"
+            >
+              Retry
+            </button>
+          </div>
+        )}
+
         <p className="mt-4 text-center text-[11px] leading-relaxed text-neutral-600">
           Your passphrase is never stored or transmitted. It only lives in memory
           while the vault is unlocked.
@@ -154,9 +199,18 @@ export function Unlock() {
   )
 }
 
-class WrongPassphraseError extends Error {
+class WrongPassphraseError extends UserFacingError {
   constructor() {
     super('Wrong passphrase. Try again.')
     this.name = 'WrongPassphraseError'
   }
+}
+
+async function initializeEncryptedVault(salt, key) {
+  const manifest = createEmptyManifest()
+  manifest.bundle_pages = 1
+  const compressedManifest = await serializeManifestCompressed(manifest)
+  const encryptedManifest = await encryptPacked(compressedManifest, key)
+  const encryptedPage = await encryptPacked(createEmptyBundle(), key)
+  await initializeVault(salt, encryptedManifest, encryptedPage)
 }

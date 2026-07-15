@@ -14,9 +14,11 @@ const WORKER_URL = import.meta.env.VITE_WORKER_URL
 
 if (!WORKER_URL) {
   // Fail loud in dev if the env var is missing — every call below would 404.
-  console.warn(
-    'VITE_WORKER_URL is not set. Copy .env.example to .env and point it at your worker.',
-  )
+  if (import.meta.env.DEV) {
+    console.warn(
+      'VITE_WORKER_URL is not set. Copy .env.example to .env and point it at your worker.',
+    )
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -51,6 +53,14 @@ export async function listIds() {
 
 export async function uploadSalt(bytes) {
   return xhrPost('/upload-salt', bytes)
+}
+
+export async function initializeVault(saltBytes, manifestBytes, bundlePageBytes) {
+  return postJson('/initialize-vault', {
+    saltBytesBase64: bytesToBase64(saltBytes),
+    manifestBytesBase64: bytesToBase64(manifestBytes),
+    bundlePageBytesBase64: bytesToBase64(bundlePageBytes),
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -136,8 +146,13 @@ export async function getChunk(id, index) {
  * @param {((e: {loaded:number,total:number,percent:number}) => void) | undefined} onProgress
  * @returns {Promise<ArrayBuffer>}
  */
-export async function uploadChunk(id, index, bytes, onProgress) {
-  return xhrPost(`/upload-chunk?id=${encodeURIComponent(id)}&index=${index}`, bytes, onProgress)
+export async function uploadChunk(id, index, bytes, onProgress, commit = true) {
+  const commitParam = commit ? '' : '&commit=false'
+  return xhrPost(
+    `/upload-chunk?id=${encodeURIComponent(id)}&index=${index}${commitParam}`,
+    bytes,
+    onProgress,
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -262,4 +277,14 @@ async function httpError(res, context) {
   const error = new Error(message)
   error.status = res.status
   return error
+}
+
+function bytesToBase64(input) {
+  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input)
+  let binary = ''
+  const chunkSize = 0x8000
+  for (let index = 0; index < bytes.byteLength; index += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(index, index + chunkSize))
+  }
+  return btoa(binary)
 }

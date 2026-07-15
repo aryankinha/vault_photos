@@ -16,10 +16,6 @@ import { loadGalleryPage, loadGalleryProgressive } from '../services/galleryServ
  *   totalPages     — total number of pages from manifest (1 for old single-bundle vaults)
  *   loadedPages    — Set of page indices already loaded
  *
- * Phase 6 will add optimistic entry merging (entries appear in gallery during upload).
- * The hook already accepts optimisticEntries + optimisticThumbs from UploadContext so
- * Phase 6 wiring is a drop-in. For now those come from the context stub (empty).
- *
  * Return shape is backward-compatible with V2. New fields are additive.
  */
 export function useGallery({
@@ -34,16 +30,21 @@ export function useGallery({
   const [loadingPage, setLoadingPage] = useState(false) // true during demand page fetch
   const [totalPages, setTotalPages] = useState(1)
   const [loadedPages, setLoadedPages] = useState(() => new Set())
+  const [pageError, setPageError] = useState(null)
   const [error, setError] = useState(null)
 
   // Ref to track the current load session so stale async updates are discarded.
   const sessionRef = useRef(0)
+  const loadingPagesRef = useRef(new Set())
 
   const runLoad = useCallback(() => {
     const session = ++sessionRef.current
     setLoading(true)
     setThumbsLoading(true)
     setLoadedPages(new Set())
+    loadingPagesRef.current.clear()
+    setLoadingPage(false)
+    setPageError(null)
     setError(null)
 
     loadGalleryProgressive((update) => {
@@ -56,18 +57,10 @@ export function useGallery({
       // Phase 'manifest' → main loading spinner can stop; grid renders.
       if (update.phase === 'manifest') {
         setLoading(false)
-        // Derive total pages from manifest bundle_pages field (default 1 for old vaults).
-        // We reach into update.entries to find max page_index; bundle_pages is the source
-        // of truth when present. For now derive from entries since we don't expose the
-        // raw manifest here. Phase 6 can expose bundle_pages explicitly if needed.
-        const maxPageIndex = update.entries.reduce(
-          (max, e) => Math.max(max, e.page_index ?? 0),
-          0,
-        )
-        setTotalPages(maxPageIndex + 1)
-        // Mark page 0 as loaded (progressive loader always loads page 0 via thumbs.bundle).
-        setLoadedPages(new Set([0]))
+        setTotalPages(update.totalPages ?? 1)
       }
+
+      if (update.loadedPages) setLoadedPages(new Set(update.loadedPages))
 
       // Phase 'done' → all thumbnails are hydrated.
       if (update.done) setThumbsLoading(false)
@@ -105,12 +98,13 @@ export function useGallery({
    * @param {number} pageIndex — zero-based page index
    */
   const loadPage = useCallback(async (pageIndex) => {
-    setLoadedPages((prev) => {
-      if (prev.has(pageIndex)) return prev   // already loaded or loading
-      return new Set(prev).add(pageIndex)    // mark loading immediately to prevent double-fetch
-    })
+    const session = sessionRef.current
+    const taskKey = `${session}:${pageIndex}`
+    if (loadingPagesRef.current.has(taskKey)) return
 
+    loadingPagesRef.current.add(taskKey)
     setLoadingPage(true)
+    setPageError(null)
     try {
       // Collect the entry ids for this page (entries with matching page_index).
       // Old V1/V2 entries have page_index === undefined → treated as page 0.
@@ -118,23 +112,27 @@ export function useGallery({
         .filter((e) => (e.page_index ?? 0) === pageIndex)
         .map((e) => e.id)
 
-      if (entryIds.length === 0) return  // no entries on this page
-
       const pageThumbMap = await loadGalleryPage(pageIndex, entryIds)
+      if (session !== sessionRef.current) return
 
       if (pageThumbMap.size > 0) {
         setThumbs((prev) => new Map([...prev, ...pageThumbMap]))
       }
+      setLoadedPages((prev) => new Set(prev).add(pageIndex))
     } catch (e) {
-      console.warn(`[useGallery] loadPage(${pageIndex}) failed:`, e)
+      if (session === sessionRef.current) setPageError(e)
+      if (import.meta.env.DEV) {
+        console.warn(`[useGallery] loadPage(${pageIndex}) failed:`, e)
+      }
       // Non-fatal — page just won't have thumbnails; user can scroll back
     } finally {
-      setLoadingPage(false)
+      loadingPagesRef.current.delete(taskKey)
+      setLoadingPage(loadingPagesRef.current.size > 0)
     }
   }, [entries])
 
   // ---------------------------------------------------------------------------
-  // Merge optimistic entries (Phase 6 wiring — additive, no-op until Phase 6)
+  // Merge optimistic entries while their atomic storage commit is in flight.
   // ---------------------------------------------------------------------------
 
   const allEntries = useMemo(() => {
@@ -161,6 +159,7 @@ export function useGallery({
     loading,
     thumbsLoading,
     loadingPage,
+    pageError,
     totalPages,
     loadedPages,
     loadPage,

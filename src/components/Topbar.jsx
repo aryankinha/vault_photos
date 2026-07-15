@@ -3,16 +3,19 @@ import { Lock, Upload, LayoutGrid } from 'lucide-react'
 import { clearActiveKey } from '../crypto/keyDerivation'
 import { clearCache } from '../session/cache'
 import { purgePrefetchCache } from '../hooks/usePrefetch'
+import { useUploadContext } from '../context/useUploadContext'
 
 export function Topbar({ title = 'VaultPhotos' }) {
   const navigate = useNavigate()
   const location = useLocation()
+  const { lockUploadSession } = useUploadContext()
   const isUploadPage = location.pathname === '/upload'
 
-  function handleLock() {
+  async function handleLock() {
+    lockUploadSession()
     clearActiveKey()
-    void clearCache()
     purgePrefetchCache()   // Phase 8 — revoke all prefetched object URLs
+    await clearCache().catch(() => {})
     navigate('/unlock', { replace: true })
   }
 

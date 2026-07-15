@@ -15,7 +15,7 @@ export function useUpload() {
   const [status, setStatus] = useState(STATUS.IDLE)
   const [error, setError] = useState(null)
   const [lastEntry, setLastEntry] = useState(null)
-  // Upload progress 0..1 for the direct-to-S3 path (null on proxy path).
+  // Aggregate Worker upload progress, normalized to 0..1.
   const [percent, setPercent] = useState(null)
 
   const upload = useCallback(async (file) => {

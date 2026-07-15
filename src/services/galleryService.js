@@ -35,13 +35,18 @@ const THUMB_BATCH_SIZE = 8
 
 export async function loadGallery() {
   const manifest = await loadManifestWithCache()
-  const thumbs = await loadThumbMapWithCache()
+  const thumbs = await loadThumbMapWithCache(manifest)
 
   const entries = [...manifest.files].sort((a, b) => {
     return b.date_taken.localeCompare(a.date_taken)
   })
 
-  return { entries, thumbs, updatedAt: manifest.updated_at }
+  return {
+    entries,
+    thumbs,
+    updatedAt: manifest.updated_at,
+    totalPages: manifest.bundle_pages ?? 1,
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -70,6 +75,8 @@ export async function loadGalleryProgressive(onUpdate) {
     b.date_taken.localeCompare(a.date_taken),
   )
   const updatedAt = manifest.updated_at
+  const totalPages = manifest.bundle_pages ?? 1
+  const isPaged = manifest.bundle_pages !== undefined
 
   // ── Phase 1b: populate thumbs from persistent IDB cache ─────────────────
   // Check IDB for every entry simultaneously (parallel reads are fast in IDB).
@@ -91,11 +98,59 @@ export async function loadGalleryProgressive(onUpdate) {
 
   // Emit Phase 1 update — grid renders immediately with all cached thumbs.
   const allCached = uncachedEntries.length === 0
-  onUpdate({ entries, thumbs: new Map(thumbs), updatedAt, phase: 'manifest', done: allCached })
+  const cachedPages = allCached
+    ? new Set(Array.from({ length: totalPages }, (_, index) => index))
+    : new Set([0])
+  onUpdate({
+    entries,
+    thumbs: new Map(thumbs),
+    updatedAt,
+    totalPages,
+    loadedPages: cachedPages,
+    phase: 'manifest',
+    done: allCached,
+  })
 
   if (allCached) {
     // Complete warm load — zero network, zero crypto, < 200ms total.
     return { entries, thumbs, updatedAt }
+  }
+
+  if (isPaged) {
+    let pageEntries = await loadBundlePage(0)
+    // Some interrupted/experimental upgrades wrote bundle_pages: 1 before
+    // creating page 0. Preserve the V1/V2 bundle in that state.
+    if (
+      pageEntries.length === 0 &&
+      manifest.bundle_pages === 1 &&
+      manifest.files.length > 0
+    ) {
+      pageEntries = await loadBundle()
+    }
+    const uncachedIds = new Set(uncachedEntries.map((entry) => entry.id))
+    const newlyDecrypted = []
+
+    for (const entry of pageEntries) {
+      if (!uncachedIds.has(entry.id)) continue
+      const blob = new Blob([entry.bytes], { type: 'image/jpeg' })
+      thumbs.set(entry.id, blob)
+      newlyDecrypted.push({ id: entry.id, blob })
+    }
+
+    if (newlyDecrypted.length > 0) {
+      void setCachedThumbs(newlyDecrypted).catch(() => {})
+    }
+
+    onUpdate({
+      entries,
+      thumbs: new Map(thumbs),
+      updatedAt,
+      totalPages,
+      loadedPages: new Set([0]),
+      phase: 'done',
+      done: true,
+    })
+    return { entries, thumbs, updatedAt, totalPages }
   }
 
   // ── Phase 2: fetch missing thumbs from bundle (off-thread decrypt) ───────
@@ -119,7 +174,15 @@ export async function loadGalleryProgressive(onUpdate) {
       encryptedBuffer = await workerClient.getBundle()
     } catch (e) {
       if (e.status === 404) {
-        onUpdate({ entries, thumbs: new Map(thumbs), updatedAt, phase: 'done', done: true })
+        onUpdate({
+          entries,
+          thumbs: new Map(thumbs),
+          updatedAt,
+          totalPages,
+          loadedPages: new Set([0]),
+          phase: 'done',
+          done: true,
+        })
         return { entries, thumbs, updatedAt }
       }
       throw e
@@ -149,7 +212,15 @@ export async function loadGalleryProgressive(onUpdate) {
     batchCount++
 
     if (batchCount % THUMB_BATCH_SIZE === 0) {
-      onUpdate({ entries, thumbs: new Map(thumbs), updatedAt, phase: 'thumbs', done: false })
+      onUpdate({
+        entries,
+        thumbs: new Map(thumbs),
+        updatedAt,
+        totalPages,
+        loadedPages: new Set([0]),
+        phase: 'thumbs',
+        done: false,
+      })
       await yieldToMain()
     }
   }
@@ -159,8 +230,16 @@ export async function loadGalleryProgressive(onUpdate) {
     void setCachedThumbs(newlyDecrypted).catch(() => {})
   }
 
-  onUpdate({ entries, thumbs: new Map(thumbs), updatedAt, phase: 'done', done: true })
-  return { entries, thumbs, updatedAt }
+  onUpdate({
+    entries,
+    thumbs: new Map(thumbs),
+    updatedAt,
+    totalPages,
+    loadedPages: new Set([0]),
+    phase: 'done',
+    done: true,
+  })
+  return { entries, thumbs, updatedAt, totalPages }
 }
 
 // ---------------------------------------------------------------------------
@@ -240,7 +319,21 @@ async function loadManifestWithCache() {
   return manifest
 }
 
-async function loadThumbMapWithCache() {
+async function loadThumbMapWithCache(manifest) {
+  if (manifest.bundle_pages !== undefined) {
+    const pages = await Promise.all(
+      Array.from({ length: manifest.bundle_pages }, (_, index) => loadBundlePage(index)),
+    )
+    if (
+      manifest.bundle_pages === 1 &&
+      manifest.files.length > 0 &&
+      pages[0].length === 0
+    ) {
+      return entriesToThumbMap(await loadBundle())
+    }
+    return entriesToThumbMap(pages.flat())
+  }
+
   const cached = await getBundleCache()
   if (cached) {
     try {
@@ -312,4 +405,3 @@ function yieldToMain() {
 
 // Re-exported for the lock flow and for callers that need to invalidate cache.
 export { clearCache } from '../session/cache'
-

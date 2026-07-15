@@ -15,7 +15,6 @@
  */
 
 const DB_NAME = 'vaultphotos-session'
-const DB_VERSION = 2
 const QUEUE_STORE = 'uploadQueue'
 
 // ---------------------------------------------------------------------------
@@ -35,7 +34,6 @@ self.addEventListener('sync', (event) => {
 async function processUploadQueue() {
   const workerUrl = await getWorkerUrl()
   if (!workerUrl) {
-    console.warn('[SW] VITE_WORKER_URL not stored — cannot retry uploads')
     return
   }
 
@@ -44,10 +42,9 @@ async function processUploadQueue() {
 
   for (const item of items) {
     try {
-      await retryUpload(workerUrl, item.id, item.encryptedBytes)
-      await deleteQueueItem(db, item.id)
-    } catch (err) {
-      console.warn(`[SW] Retry failed for ${item.id}:`, err)
+      const uploaded = await retryUpload(workerUrl, item.id, item.encryptedBytes)
+      await markQueueItemUploaded(db, item, uploaded)
+    } catch {
       // Leave in queue — will retry on next sync event.
     }
   }
@@ -59,7 +56,7 @@ async function processUploadQueue() {
  * the blob is already encrypted and we just send it as-is to the proxy).
  */
 async function retryUpload(workerUrl, id, encryptedBytes) {
-  const res = await fetch(`${workerUrl}/upload-file?id=${encodeURIComponent(id)}`, {
+  const res = await fetch(`${workerUrl}/upload-file?id=${encodeURIComponent(id)}&commit=false`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/octet-stream' },
     body: encryptedBytes,
@@ -68,6 +65,7 @@ async function retryUpload(workerUrl, id, encryptedBytes) {
     const text = await res.text().catch(() => '')
     throw new Error(`Worker returned ${res.status}: ${text.slice(0, 200)}`)
   }
+  return res.json()
 }
 
 // ---------------------------------------------------------------------------
@@ -96,7 +94,9 @@ async function getWorkerUrl() {
 
 function openDB() {
   return new Promise((resolve, reject) => {
-    const req = self.indexedDB.open(DB_NAME, DB_VERSION)
+    // Open the current version. Supplying an older hard-coded version causes a
+    // VersionError after the app adds new stores in a later release.
+    const req = self.indexedDB.open(DB_NAME)
     req.onsuccess = () => resolve(req.result)
     req.onerror = () => reject(req.error)
     req.onupgradeneeded = (e) => {
@@ -121,12 +121,22 @@ function getAllQueueItems(db) {
   })
 }
 
-function deleteQueueItem(db, id) {
+function markQueueItemUploaded(db, item, uploaded) {
   return new Promise((resolve, reject) => {
     const tx = db.transaction(QUEUE_STORE, 'readwrite')
     const store = tx.objectStore(QUEUE_STORE)
-    const req = store.delete(id)
-    req.onsuccess = () => resolve()
-    req.onerror = () => reject(req.error)
+    const getRequest = store.get(item.id)
+    getRequest.onerror = () => reject(getRequest.error)
+    getRequest.onsuccess = () => {
+      // The foreground app may have committed and dequeued this item while the
+      // service worker upload was in flight. Never resurrect a completed row.
+      if (!getRequest.result) {
+        resolve()
+        return
+      }
+      const putRequest = store.put({ ...getRequest.result, uploaded })
+      putRequest.onsuccess = () => resolve()
+      putRequest.onerror = () => reject(putRequest.error)
+    }
   })
 }

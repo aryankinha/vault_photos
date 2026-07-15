@@ -1,6 +1,9 @@
 import { useEffect, useState } from 'react'
 import { loadFullMedia } from '../services/viewerService'
 import { createVideoStream, isMseSupported } from '../services/videoStreamService'
+import { claimPrefetched } from './usePrefetch'
+
+const claimedPrefetchUrls = new Set()
 
 /**
  * Load and decrypt a single media file. `entry` must carry `id`, `type`, and
@@ -24,9 +27,10 @@ import { createVideoStream, isMseSupported } from '../services/videoStreamServic
  *   streaming      — true while an MSE stream is in progress
  *   streamProgress — 0–1 fraction of chunks received (0 until first chunk)
  */
-export function useViewer(entry, prefetchedUrl) {
+export function useViewer(entry, prefetchedMedia, reloadKey = 0) {
   const [objectUrl, setObjectUrl] = useState(null)
-  const [state, setState] = useState({ loading: true, error: null })
+  const [objectEntryId, setObjectEntryId] = useState(null)
+  const [state, setState] = useState({ entryId: null, loading: true, error: null })
   const [streamProgress, setStreamProgress] = useState(0)
   const [streaming, setStreaming] = useState(false)
 
@@ -34,20 +38,39 @@ export function useViewer(entry, prefetchedUrl) {
     if (!entry) return undefined
 
     // ── Phase 8: instant path — a prefetched URL is already in memory ────────
-    if (prefetchedUrl) {
+    if (prefetchedMedia) {
       let active = true
+      let ownedUrl = null
+      claimPrefetched(entry.id, prefetchedMedia)
       // Defer all setState calls to a microtask — same pattern as the normal path.
       // This satisfies react-hooks/set-state-in-effect and avoids cascading renders.
-      Promise.resolve().then(() => {
-        if (!active) return
-        setObjectUrl(prefetchedUrl)
-        setState({ loading: false, error: null })
-        setStreaming(false)
-        setStreamProgress(1)
-      })
+      Promise.resolve(prefetchedMedia)
+        .then((createdUrl) => {
+          if (!active) {
+            setTimeout(() => {
+              if (!claimedPrefetchUrls.has(createdUrl)) {
+                URL.revokeObjectURL(createdUrl)
+              }
+            }, 0)
+            return
+          }
+          ownedUrl = createdUrl
+          claimedPrefetchUrls.add(createdUrl)
+          setObjectUrl(createdUrl)
+          setObjectEntryId(entry.id)
+          setState({ entryId: entry.id, loading: false, error: null })
+          setStreaming(false)
+          setStreamProgress(1)
+        })
+        .catch((error) => {
+          if (active) setState({ entryId: entry.id, loading: false, error })
+        })
       return () => {
         active = false
-        URL.revokeObjectURL(prefetchedUrl)
+        if (ownedUrl) {
+          claimedPrefetchUrls.delete(ownedUrl)
+          URL.revokeObjectURL(ownedUrl)
+        }
       }
     }
 
@@ -67,25 +90,49 @@ export function useViewer(entry, prefetchedUrl) {
 
         const stream = createVideoStream(entry, mime, {
           onProgress: (p) => setStreamProgress(p),
-          onError: (err) => {
-            // If MSE fails mid-stream, mark error so the user sees it rather than a frozen video.
-            setState({ loading: false, error: err })
-            setStreaming(false)
-          },
         })
 
         if (stream) {
           const cleanupFn = stream.cleanup
+          let fallbackOwnedUrl = null
           // Hand the URL to the video element via microtask — stream.url is already set.
           Promise.resolve().then(() => {
             if (!mseActive) return
             setObjectUrl(stream.url)
-            setState({ loading: false, error: null })
+            setObjectEntryId(entry.id)
+            setState({ entryId: entry.id, loading: false, error: null })
           })
+          stream.done
+            .then(() => {
+              if (!mseActive) return
+              setStreaming(false)
+              setStreamProgress(1)
+            })
+            .catch(() => {
+              if (!mseActive) return
+              cleanupFn?.()
+              setStreaming(false)
+              setState({ entryId: entry.id, loading: true, error: null })
+              return loadFullMedia(entry, mime)
+                .then((fallbackUrl) => {
+                  if (!mseActive) {
+                    URL.revokeObjectURL(fallbackUrl)
+                    return
+                  }
+                  fallbackOwnedUrl = fallbackUrl
+                  setObjectUrl(fallbackUrl)
+                  setObjectEntryId(entry.id)
+                  setState({ entryId: entry.id, loading: false, error: null })
+                })
+                .catch((error) => {
+                  if (mseActive) setState({ entryId: entry.id, loading: false, error })
+                })
+            })
           return () => {
             mseActive = false
             setStreaming(false)
             cleanupFn?.()
+            if (fallbackOwnedUrl) URL.revokeObjectURL(fallbackOwnedUrl)
           }
         }
         // stream === null means isMseSupported returned true but
@@ -103,7 +150,7 @@ export function useViewer(entry, prefetchedUrl) {
     // Reset to loading for the new entry via the async microtask, not synchronously.
     Promise.resolve().then(() => {
       if (!cancelled) {
-        setState({ loading: true, error: null })
+        setState({ entryId: entry.id, loading: true, error: null })
         setStreaming(false)
         setStreamProgress(0)
       }
@@ -118,24 +165,26 @@ export function useViewer(entry, prefetchedUrl) {
         }
         url = created
         setObjectUrl(created)
+        setObjectEntryId(entry.id)
         setStreamProgress(1)
-        setState({ loading: false, error: null })
+        setState({ entryId: entry.id, loading: false, error: null })
       })
       .catch((e) => {
         if (cancelled) return
-        setState({ loading: false, error: e })
+        setState({ entryId: entry.id, loading: false, error: e })
       })
 
     return () => {
       cancelled = true
       if (url) URL.revokeObjectURL(url)
     }
-  }, [entry, prefetchedUrl])
+  }, [entry, prefetchedMedia, reloadKey])
 
+  const isCurrentEntry = state.entryId === entry?.id
   return {
-    objectUrl,
-    loading: state.loading,
-    error: state.error,
+    objectUrl: objectEntryId === entry?.id ? objectUrl : null,
+    loading: isCurrentEntry ? state.loading : Boolean(entry),
+    error: isCurrentEntry ? state.error : null,
     streaming,
     streamProgress,
   }

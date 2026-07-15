@@ -1,14 +1,18 @@
 import { useState, useMemo, useEffect, useRef, useCallback } from 'react'
-import { ImageOff, Loader2, RefreshCw, LayoutGrid, Image as ImageIcon, Film } from 'lucide-react'
+import { useNavigate } from 'react-router-dom'
+import { ImageOff, Loader2, RefreshCw, LayoutGrid, Image as ImageIcon, Film, Upload } from 'lucide-react'
 import { Topbar } from '../components/Topbar'
 import { PhotoGrid } from '../components/PhotoGrid'
 import { useGallery } from '../hooks/useGallery'
 import { useUploadContext } from '../context/useUploadContext'
+import { getUserErrorMessage } from '../utils/errors'
+import { hasActiveKey } from '../crypto/keyDerivation'
 
 export function Gallery() {
+  const navigate = useNavigate()
   const {
     entries, thumbs, loading, thumbsLoading,
-    loadingPage, totalPages, loadedPages, loadPage,
+    loadingPage, pageError, totalPages, loadedPages, loadPage,
     error, reload,
   } = useGallery()
   const {
@@ -17,13 +21,18 @@ export function Gallery() {
     optimisticThumbs,
     optimisticStates,
     retryOptimistic,
+    resumePendingUploads,
   } = useUploadContext()
   const [filter, setFilter] = useState('all')
+
+  useEffect(() => {
+    Promise.resolve().then(() => resumePendingUploads())
+  }, [resumePendingUploads])
 
   // Auto-reload when background upload finishes
   const wasUploadingRef = useRef(false)
   useEffect(() => {
-    if (wasUploadingRef.current && !isUploading) {
+    if (wasUploadingRef.current && !isUploading && hasActiveKey()) {
       void reload()
     }
     wasUploadingRef.current = isUploading
@@ -61,6 +70,15 @@ export function Gallery() {
     return new Map([...thumbs, ...optimisticThumbs])
   }, [thumbs, optimisticThumbs])
 
+  // Render only hydrated pages. Keeping the sentinel directly after the last
+  // visible page prevents thousands of unloaded entries from appearing as a
+  // wall of placeholders before page 1 is requested.
+  const visibleEntries = useMemo(() => mergedEntries.filter((entry) => (
+    optimisticStates?.has(entry.id) ||
+    loadedPages.has(entry.page_index ?? 0) ||
+    mergedThumbs.has(entry.id)
+  )), [mergedEntries, optimisticStates, loadedPages, mergedThumbs])
+
 
   // ---------------------------------------------------------------------------
   // IntersectionObserver — trigger loadPage when user nears the bottom
@@ -75,10 +93,10 @@ export function Gallery() {
   }, [totalPages, loadedPages])
 
   const handleLoadNextPage = useCallback(() => {
-    if (nextPage !== null && !loadingPage) {
+    if (nextPage !== null && !loadingPage && !pageError) {
       loadPage(nextPage)
     }
-  }, [nextPage, loadingPage, loadPage])
+  }, [nextPage, loadingPage, pageError, loadPage])
 
   useEffect(() => {
     const sentinel = sentinelRef.current
@@ -144,13 +162,11 @@ export function Gallery() {
 
       <main className="pb-16">
         {loading && entries.length === 0 && (optimisticEntries?.length ?? 0) === 0 ? (
-          <div className="flex justify-center py-24 text-neutral-500">
-            <Loader2 className="animate-spin" size={22} />
-          </div>
+          <GallerySkeleton />
         ) : error ? (
           <ErrorState error={error} onRetry={reload} />
-        ) : mergedEntries.length === 0 ? (
-          <EmptyState />
+        ) : entries.length === 0 && (optimisticEntries?.length ?? 0) === 0 ? (
+          <EmptyState onUpload={() => navigate('/upload')} />
         ) : mergedEntries.length === 0 ? (
           <div className="mx-auto flex max-w-md flex-col items-center px-6 py-24 text-center">
             <span className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-white/5 text-neutral-500 ring-1 ring-white/10">
@@ -164,7 +180,7 @@ export function Gallery() {
         ) : (
           <>
             <PhotoGrid
-              entries={mergedEntries}
+              entries={visibleEntries}
               thumbs={mergedThumbs}
               optimisticStates={optimisticStates}
               onRetry={retryOptimistic}
@@ -188,6 +204,18 @@ export function Gallery() {
                 <span>Loading more…</span>
               </div>
             )}
+            {pageError && nextPage !== null && (
+              <div className="flex items-center justify-center gap-3 py-6 text-xs text-neutral-500">
+                <span>Couldn't load more thumbnails.</span>
+                <button
+                  type="button"
+                  onClick={() => loadPage(nextPage)}
+                  className="rounded-lg bg-white/5 px-2.5 py-1.5 font-medium text-neutral-200 ring-1 ring-white/10 hover:bg-white/10"
+                >
+                  Retry
+                </button>
+              </div>
+            )}
           </>
         )}
       </main>
@@ -195,17 +223,40 @@ export function Gallery() {
   )
 }
 
-function EmptyState() {
+function EmptyState({ onUpload }) {
   return (
     <div className="mx-auto flex max-w-md flex-col items-center px-6 py-24 text-center">
-      <span className="mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-white/5 text-neutral-500 ring-1 ring-white/10">
-        <ImageOff size={24} />
-      </span>
+      <svg viewBox="0 0 120 92" className="mb-5 h-24 w-32 text-neutral-500" aria-hidden="true">
+        <rect x="17" y="18" width="86" height="62" rx="7" fill="none" stroke="currentColor" strokeWidth="3" />
+        <circle cx="43" cy="39" r="8" fill="currentColor" opacity=".55" />
+        <path d="M25 70 49 51l15 13 12-10 20 16" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" />
+        <path d="M60 8v20M50 18h20" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
+      </svg>
       <h2 className="text-sm font-semibold text-neutral-200">Your vault is empty</h2>
-      <p className="mt-1 text-xs text-neutral-500">
-        Upload a photo or video to get started. Everything is encrypted on your
-        device before it leaves.
+      <p className="mt-1 max-w-sm text-xs leading-relaxed text-neutral-500">
+        Upload photos and videos — they will be encrypted before leaving your device
       </p>
+      <button
+        type="button"
+        onClick={onUpload}
+        className="mt-5 inline-flex items-center gap-2 rounded-lg bg-sky-500 px-4 py-2 text-sm font-semibold text-white hover:bg-sky-400"
+      >
+        <Upload size={15} />
+        Upload your first photo
+      </button>
+    </div>
+  )
+}
+
+function GallerySkeleton() {
+  return (
+    <div className="mx-auto max-w-6xl px-3 py-6" aria-label="Loading gallery">
+      <div className="mb-3 h-3 w-28 animate-pulse rounded bg-white/10" />
+      <div className="grid grid-cols-3 gap-1.5 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6">
+        {Array.from({ length: 18 }, (_, index) => (
+          <div key={index} className="aspect-square animate-pulse rounded-lg bg-neutral-900" />
+        ))}
+      </div>
     </div>
   )
 }
@@ -218,7 +269,7 @@ function ErrorState({ error, onRetry }) {
       </span>
       <h2 className="text-sm font-semibold text-neutral-200">Couldn't load gallery</h2>
       <p className="mt-1 max-w-xs break-words text-xs text-neutral-500">
-        {error.message}
+        {getUserErrorMessage(error, 'Check your connection and try again.')}
       </p>
       <button
         type="button"
@@ -231,4 +282,3 @@ function ErrorState({ error, onRetry }) {
     </div>
   )
 }
-

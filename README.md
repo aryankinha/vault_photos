@@ -21,15 +21,22 @@ Hugging Face Dataset repo (stores only encrypted blobs)
 - **Key derivation:** Argon2id (t=3, m=64MB, p=4) from passphrase + 16-byte salt
   → 256-bit AES key. The key lives only in a module-level JS variable in RAM.
   Refreshing the page clears it and asks for the passphrase again.
-- **Encryption:** AES-256-GCM via Web Crypto. Every file is stored as
-  `[12-byte nonce][ciphertext+16-byte tag]`. Tampering is detected on decrypt.
+- **Encryption:** AES-256-GCM via Web Crypto. Non-chunked objects keep the V1
+  `[12-byte nonce][ciphertext+16-byte tag]` format. Files at least 50 MiB use
+  independently authenticated 32 MiB chunks with the chunk index as AAD.
+- **Responsiveness:** A pool of up to four module workers performs transferable
+  file/chunk crypto away from the UI thread.
 - **Storage layout in HF:**
   - `salt.bin` — Argon2 salt (16 bytes)
-  - `manifest.enc` — encrypted JSON index of all files
-  - `thumbs.bundle` — one encrypted blob with all thumbnails concatenated
+  - `manifest.enc` — encrypted gzip JSON index (old plain JSON still loads)
+  - `thumbs.bundle` — legacy encrypted thumbnail bundle
+  - `thumbs_page_N.bundle` — V3 encrypted pages of up to 50 thumbnails
   - `files/<id>.enc` — encrypted full-resolution media (LFS-backed)
+  - `files/<id>_chunk_<n>.enc` — encrypted chunks for large files
 - **The worker never sees decrypted content.** It only proxies bytes and holds
   the HF token. The app never talks to HF directly.
+- **Local caches:** low-resolution JPEG previews persist in IndexedDB by design;
+  repeat-view full files persist in OPFS only as encrypted HF bytes.
 
 ## Tech stack
 
@@ -76,8 +83,9 @@ npx wrangler secret put HF_REPO
 #   value: your-username/vaultphotos
 ```
 
-The first upload auto-initializes `.gitattributes` in the repo so that
-`files/**` is stored via LFS — this is required for large videos.
+Vault creation atomically commits the salt, encrypted empty manifest, and empty
+thumbnail page. The first media upload also initializes `.gitattributes` so
+`files/**` is stored via LFS.
 
 Smoke-test the worker (should return 404 on a fresh repo, meaning "no salt yet"):
 
@@ -92,7 +100,7 @@ npm run dev
 ```
 
 Open the printed URL. The first run shows a **Create vault** screen (passphrase
-twice → generates and uploads the salt). Subsequent runs show **Unlock**. If you
+twice → atomically initializes the encrypted vault). Subsequent runs show **Unlock**. If you
 enter the wrong passphrase, decryption of the manifest fails and you get a clear
 error — there is no way to detect a wrong passphrase except by trying to decrypt.
 
@@ -106,7 +114,8 @@ npm run build
 ```
 
 On Vercel, set the `VITE_WORKER_URL` environment variable to your worker URL and
-redeploy. `vercel.json` already includes the SPA rewrite so client-side routes
+redeploy. The build inserts that origin into the Content Security Policy;
+changing it therefore requires a rebuild. `vercel.json` includes the SPA rewrite so client-side routes
 (`/gallery`, `/view/:id`, ...) resolve on refresh.
 
 ## Security notes
@@ -116,20 +125,28 @@ redeploy. `vercel.json` already includes the SPA rewrite so client-side routes
 - HF sees only encrypted blobs. The worker sees only encrypted blobs. Only a
   browser that has performed Argon2id key derivation with the correct passphrase
   can decrypt.
-- The session cache (IndexedDB) stores only decrypted manifest/bundle bytes, and
-  only while the vault is unlocked. The key is never persisted. Locking or
-  closing the tab wipes it.
+- The key is never persisted. Decrypted manifest/bundle session data is cleared
+  on lock and before each fresh document renders. Persistent preview JPEGs are
+  an explicit trusted-device tradeoff; full-resolution OPFS files are ciphertext.
 - AES-256-GCM authenticates every file; any tampered blob fails to decrypt.
+- A public Worker URL hides the HF token but is not user authentication. It can
+  still be targeted for write/availability abuse, so apply deployment-level
+  access controls when your hosting model allows it.
 
-## V1 scope
+## Scope
 
-Focused on the core encrypt → upload → gallery → view flow working reliably.
-Not in V1: GPS display, albums, search, sharing, multi-device key sync, tags,
-favorites, size-padding. All V2.
+Focused on the encrypted upload → gallery → view flow, including progressive
+pages, large-file chunks, recovery, and local ciphertext caching. GPS display,
+albums, search, sharing, multi-device key sync, tags, favorites, and size
+padding remain out of scope.
 
 ## Scripts
 
 - `npm run dev` — Vite dev server
 - `npm run build` — production build to `dist/`
 - `npm run lint` — ESLint
+- `npm test` — schema, crypto, and backward-compatibility tests
 - `npm run preview` — preview the production build locally
+
+The repeatable real-browser worker check lives at
+`/tests/browser/cryptoWorkerHarness.html` while `npm run dev` is running.

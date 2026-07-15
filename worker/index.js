@@ -60,9 +60,13 @@ export default {
       })
     } catch (error) {
       const status = error.status || 500
-      const message = error.message || 'Worker error'
-      console.error('VaultPhotos worker error:', message)
-      return json({ error: message }, status)
+      console.error('VaultPhotos storage request failed', {
+        status,
+        route: url.pathname,
+      })
+      return json({
+        error: status === 404 ? 'Not found' : 'Storage request failed',
+      }, status)
     }
   },
 }
@@ -70,6 +74,7 @@ export default {
 function route(path, method) {
   if (path === '/get-salt' && method === 'GET') return getSalt
   if (path === '/upload-salt' && method === 'POST') return uploadSalt
+  if (path === '/initialize-vault' && method === 'POST') return initializeVault
   if (path === '/get-manifest' && method === 'GET') return getManifest
   if (path === '/upload-manifest' && method === 'POST') return uploadManifest
   if (path === '/get-bundle' && method === 'GET') return getBundle
@@ -105,6 +110,42 @@ async function uploadSalt({ request, env }) {
   const bytes = await readRawBody(request)
   await ensureGitAttributes(env)
   await hfGitCommit(env, 'salt.bin', bytes, 'Update salt')
+  return json({ ok: true }, 200)
+}
+
+async function initializeVault({ request, env }) {
+  const {
+    saltBytesBase64,
+    manifestBytesBase64,
+    bundlePageBytesBase64,
+  } = await request.json()
+
+  if (
+    typeof saltBytesBase64 !== 'string' ||
+    typeof manifestBytesBase64 !== 'string' ||
+    typeof bundlePageBytesBase64 !== 'string'
+  ) {
+    return json({ error: 'Invalid initialization payload' }, 400)
+  }
+  if (base64ToBytes(saltBytesBase64).byteLength !== 16) {
+    return json({ error: 'Salt must be exactly 16 bytes' }, 400)
+  }
+
+  const tree = await hfListTree(env, '')
+  if (tree.some((entry) => entry.path === 'manifest.enc')) {
+    return json({ error: 'Vault is already initialized' }, 409)
+  }
+
+  await ensureGitAttributes(env)
+  const files = [
+    { path: 'manifest.enc', content: manifestBytesBase64 },
+    { path: 'thumbs_page_0.bundle', content: bundlePageBytesBase64 },
+  ]
+  if (!tree.some((entry) => entry.path === 'salt.bin')) {
+    files.unshift({ path: 'salt.bin', content: saltBytesBase64 })
+  }
+
+  await hfGitCommitBatch(env, 'Initialize encrypted vault', files, [])
   return json({ ok: true }, 200)
 }
 
@@ -290,10 +331,22 @@ async function commitUpload({ request, env }) {
 
 async function commitBatch({ request, env }) {
   const body = await request.json()
-  const { files, manifestBytesBase64, bundleBytesBase64 } = body
+  const {
+    files,
+    chunks = [],
+    manifestBytesBase64,
+    bundleBytesBase64,
+    bundlePages = [],
+  } = body
 
-  if (!Array.isArray(files)) {
-    return json({ error: 'Missing or invalid files array' }, 400)
+  if (!Array.isArray(files) || !Array.isArray(chunks) || !Array.isArray(bundlePages)) {
+    return json({ error: 'Invalid batch arrays' }, 400)
+  }
+  if (
+    (manifestBytesBase64 !== undefined && (typeof manifestBytesBase64 !== 'string' || manifestBytesBase64.length === 0)) ||
+    (bundleBytesBase64 !== undefined && (typeof bundleBytesBase64 !== 'string' || bundleBytesBase64.length === 0))
+  ) {
+    return json({ error: 'Invalid batch file content' }, 400)
   }
 
   const filesToCommit = []
@@ -302,6 +355,19 @@ async function commitBatch({ request, env }) {
   }
   if (bundleBytesBase64) {
     filesToCommit.push({ path: 'thumbs.bundle', content: bundleBytesBase64 })
+  }
+  for (const page of bundlePages) {
+    if (
+      !isValidIndex(page.pageIndex) ||
+      typeof page.bytesBase64 !== 'string' ||
+      page.bytesBase64.length === 0
+    ) {
+      return json({ error: 'Invalid bundle page in batch' }, 400)
+    }
+    filesToCommit.push({
+      path: `thumbs_page_${page.pageIndex}.bundle`,
+      content: page.bytesBase64,
+    })
   }
 
   const lfsFilesToCommit = []
@@ -319,6 +385,26 @@ async function commitBatch({ request, env }) {
       path: `files/${f.id}.enc`,
       size: f.size,
       oid: f.sha256,
+    })
+  }
+
+  for (const chunk of chunks) {
+    if (!chunk.id || !/^[0-9a-f]{16}$/i.test(chunk.id)) {
+      return json({ error: 'Invalid chunk file id in batch' }, 400)
+    }
+    if (!isValidIndex(chunk.index)) {
+      return json({ error: 'Invalid chunk index in batch' }, 400)
+    }
+    if (!chunk.sha256 || !/^[0-9a-f]{64}$/i.test(chunk.sha256)) {
+      return json({ error: 'Invalid chunk sha256 in batch' }, 400)
+    }
+    if (!Number.isFinite(chunk.size) || chunk.size <= 0) {
+      return json({ error: 'Invalid chunk size in batch' }, 400)
+    }
+    lfsFilesToCommit.push({
+      path: `files/${chunk.id}_chunk_${chunk.index}.enc`,
+      size: chunk.size,
+      oid: chunk.sha256,
     })
   }
 
@@ -367,8 +453,12 @@ async function hfGitCommitBatch(env, summary, filesToCommit, lfsFilesToCommit) {
 
 async function listFiles({ env }) {
   const tree = await hfListTree(env, 'files')
-  const ids = tree.map((entry) => entry.path.replace(/^files\//, '').replace(/\.enc$/, ''))
-  return json(ids, 200)
+  const ids = new Set()
+  for (const entry of tree) {
+    const match = entry.path.match(/^files\/([0-9a-f]{16})(?:_chunk_\d+)?\.enc$/i)
+    if (match) ids.add(match[1])
+  }
+  return json([...ids], 200)
 }
 
 // ---------------------------------------------------------------------------
@@ -382,6 +472,9 @@ async function listFiles({ env }) {
  * as an empty page — valid for galleries still using the legacy single-bundle).
  */
 async function getBundlePage({ env }, pageIndex) {
+  if (!isValidIndex(pageIndex)) {
+    return json({ error: 'Invalid bundle page index' }, 400)
+  }
   const filename = `thumbs_page_${pageIndex}.bundle`
   return hfResolve(env, filename)
 }
@@ -391,6 +484,9 @@ async function getBundlePage({ env }, pageIndex) {
  * Uploads encrypted bundle page bytes to HF as thumbs_page_N.bundle.
  */
 async function uploadBundlePage({ request, env }, pageIndex) {
+  if (!isValidIndex(pageIndex)) {
+    return json({ error: 'Invalid bundle page index' }, 400)
+  }
   const bytes = await readRawBody(request)
   await ensureGitAttributes(env)
   const filename = `thumbs_page_${pageIndex}.bundle`
@@ -411,6 +507,9 @@ async function getChunkHandler({ env }, id, index) {
   if (!id || !/^[0-9a-f]{16}$/i.test(id)) {
     return json({ error: 'Missing or invalid file id' }, 400)
   }
+  if (!isValidIndex(index)) {
+    return json({ error: 'Missing or invalid chunk index' }, 400)
+  }
   return hfResolve(env, `files/${id}_chunk_${index}.enc`)
 }
 
@@ -426,14 +525,15 @@ async function uploadChunkHandler({ request, url, env }) {
     return json({ error: 'Missing or invalid id query param' }, 400)
   }
   const index = Number(indexStr)
-  if (!Number.isInteger(index) || index < 0) {
+  if (!isValidIndex(index)) {
     return json({ error: 'Missing or invalid index query param' }, 400)
   }
+  const commit = url.searchParams.get('commit') !== 'false'
 
   const bytes = await readRawBody(request)
   const path = `files/${id}_chunk_${index}.enc`
   await ensureGitAttributes(env)
-  const result = await hfUploadFile(env, path, bytes, true)
+  const result = await hfUploadFile(env, path, bytes, commit)
   return json({ ok: true, id, index, sha256: result.oid, size: result.size }, 200)
 }
 
@@ -455,7 +555,13 @@ function authHeaders(env, extra = {}) {
  */
 async function hfResolve(env, path) {
   // Bust cache for mutable manifest, bundle, and salt to prevent CDN/caching issues
-  const isMutable = path === 'manifest.enc' || path === 'thumbs.bundle' || path === 'salt.bin'
+  const isMutable = (
+    path === 'manifest.enc' ||
+    path === 'thumbs.bundle' ||
+    path === 'salt.bin' ||
+    path === '.gitattributes' ||
+    /^thumbs_page_\d+\.bundle$/.test(path)
+  )
   const url = isMutable
     ? `${HF_API}/datasets/${env.HF_REPO}/resolve/main/${path}?t=${Date.now()}`
     : `${HF_API}/datasets/${env.HF_REPO}/resolve/main/${path}`
@@ -626,15 +732,32 @@ async function hfListTree(env, folder) {
  * once. Checked via a lightweight tree listing of the repo root.
  */
 let gitAttributesEnsured = false
+let gitAttributesPromise = null
 async function ensureGitAttributes(env) {
   if (gitAttributesEnsured) return
-  const tree = await hfListTree(env, '')
-  const exists = tree.some((entry) => entry.path === '.gitattributes')
-  if (!exists) {
-    const bytes = new TextEncoder().encode(GITATTRIBUTES_CONTENT)
-    await hfGitCommit(env, '.gitattributes', bytes, 'Initialize LFS for files/')
+  if (!gitAttributesPromise) {
+    gitAttributesPromise = (async () => {
+      const tree = await hfListTree(env, '')
+      const exists = tree.some((entry) => entry.path === '.gitattributes')
+      let content = ''
+      if (exists) {
+        const response = await hfResolve(env, '.gitattributes')
+        content = await response.text()
+      }
+
+      if (!content.split(/\r?\n/).some((line) => line.startsWith('files/** '))) {
+        const separator = content.length > 0 && !content.endsWith('\n') ? '\n' : ''
+        const bytes = new TextEncoder().encode(
+          `${content}${separator}${GITATTRIBUTES_CONTENT}`,
+        )
+        await hfGitCommit(env, '.gitattributes', bytes, 'Configure LFS for files/')
+      }
+      gitAttributesEnsured = true
+    })().finally(() => {
+      gitAttributesPromise = null
+    })
   }
-  gitAttributesEnsured = true
+  await gitAttributesPromise
 }
 
 // ---------------------------------------------------------------------------
@@ -662,14 +785,22 @@ async function sha256Hex(bytes) {
 }
 
 async function hfError(res, context) {
-  let detail = ''
-  try {
-    const text = await res.text()
-    detail = text ? ` — ${text.slice(0, 500)}` : ''
-  } catch { /* ignore */ }
-  const err = new Error(`HF ${res.status} ${context}${detail}`)
+  const err = new Error(`HF ${res.status} ${context}`)
   err.status = res.status === 404 ? 404 : 502
   return err
+}
+
+function base64ToBytes(value) {
+  try {
+    const binary = atob(value)
+    return Uint8Array.from(binary, (character) => character.charCodeAt(0))
+  } catch {
+    return new Uint8Array()
+  }
+}
+
+function isValidIndex(value) {
+  return Number.isSafeInteger(value) && value >= 0
 }
 
 function json(body, status = 200) {

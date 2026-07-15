@@ -1,102 +1,177 @@
 /**
- * chunkEncrypt.js — Chunked AES-GCM encrypt/decrypt generators.
- *
- * For files >= 50MB, we encrypt and upload in sequential chunks to avoid
- * memory saturation. We use the 4-byte chunk index (Big-Endian) as AES-GCM
- * Additional Authenticated Data (AAD) to prevent chunk reordering attacks.
+ * Chunked AES-256-GCM with the big-endian chunk index authenticated as AAD.
+ * New chunks are packed as [index:4][nonce:12][ciphertext+tag]. Decryption also
+ * accepts the earlier V3 [nonce:12][ciphertext+tag] layout for compatibility.
  */
 
+import {
+  decryptChunkWithPool,
+  encryptChunkWithPool,
+  isCryptoPoolSupported,
+} from '../workers/cryptoWorkerPool.js'
+
+export const CHUNK_SIZE = 32 * 1024 * 1024
+
+const INDEX_BYTES = 4
 const NONCE_BYTES = 12
+const TAG_BYTES = 16
 
-/**
- * Encrypt a single chunk buffer with its index as AAD.
- *
- * @param {ArrayBuffer} chunkBytes — plaintext chunk data
- * @param {CryptoKey} key — AES-256 key
- * @param {number} index — zero-based chunk index
- * @returns {Promise<ArrayBuffer>} — [nonce | ciphertext+tag]
- */
 export async function encryptChunk(chunkBytes, key, index) {
+  const plaintext = toUint8Array(chunkBytes)
+  const aad = encodeIndex(index)
   const nonce = crypto.getRandomValues(new Uint8Array(NONCE_BYTES))
-  
-  // Format the index as a 4-byte big-endian AAD
-  const aad = new Uint8Array(4)
-  new DataView(aad.buffer).setUint32(0, index, false)
-
   const ciphertext = await crypto.subtle.encrypt(
     { name: 'AES-GCM', iv: nonce, tagLength: 128, additionalData: aad },
     key,
-    chunkBytes,
+    plaintext,
   )
 
-  const output = new Uint8Array(nonce.byteLength + ciphertext.byteLength)
-  output.set(nonce, 0)
-  output.set(new Uint8Array(ciphertext), nonce.byteLength)
+  const output = new Uint8Array(INDEX_BYTES + NONCE_BYTES + ciphertext.byteLength)
+  output.set(aad, 0)
+  output.set(nonce, INDEX_BYTES)
+  output.set(new Uint8Array(ciphertext), INDEX_BYTES + NONCE_BYTES)
   return output.buffer
 }
 
-/**
- * Decrypt a single chunk buffer with its index as AAD.
- *
- * @param {ArrayBuffer|Uint8Array} packedBuffer — [nonce | ciphertext+tag]
- * @param {CryptoKey} key — AES-256 key
- * @param {number} index — zero-based chunk index
- * @returns {Promise<ArrayBuffer>} — plaintext chunk
- */
-export async function decryptChunk(packedBuffer, key, index) {
-  const bytes = packedBuffer instanceof Uint8Array ? packedBuffer : new Uint8Array(packedBuffer)
-  if (bytes.byteLength <= NONCE_BYTES) {
+export async function decryptChunk(packedBuffer, key, expectedIndex) {
+  const bytes = toUint8Array(packedBuffer)
+  if (bytes.byteLength <= INDEX_BYTES + NONCE_BYTES + TAG_BYTES) {
     throw new Error('Encrypted chunk is too short')
   }
 
-  const nonce = bytes.slice(0, NONCE_BYTES)
-  const ciphertext = bytes.slice(NONCE_BYTES)
+  const storedIndex = new DataView(
+    bytes.buffer,
+    bytes.byteOffset,
+    INDEX_BYTES,
+  ).getUint32(0, false)
 
-  // Format the index as a 4-byte big-endian AAD
-  const aad = new Uint8Array(4)
-  new DataView(aad.buffer).setUint32(0, index, false)
+  if (storedIndex === expectedIndex) {
+    try {
+      return await decryptCurrentChunk(bytes, key, expectedIndex)
+    } catch (currentError) {
+      // A legacy nonce has a 1-in-2^32 chance of beginning with expectedIndex.
+      // Try the old layout before reporting the authenticated failure.
+      try {
+        return await decryptLegacyChunk(bytes, key, expectedIndex)
+      } catch {
+        throw currentError
+      }
+    }
+  }
 
-  return crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv: nonce, tagLength: 128, additionalData: aad },
+  // Legacy V3 chunks did not store the index prefix, but still authenticated
+  // the caller-supplied index as AAD. A reordered current-format chunk also
+  // reaches this branch and fails GCM verification under the legacy layout.
+  return decryptLegacyChunk(bytes, key, expectedIndex)
+}
+
+export async function* encryptChunked(buffer, key, onProgress) {
+  const bytes = toUint8Array(buffer)
+  const totalChunks = Math.ceil(bytes.byteLength / CHUNK_SIZE)
+
+  for (let index = 0; index < totalChunks; index += 1) {
+    const start = index * CHUNK_SIZE
+    const end = Math.min(start + CHUNK_SIZE, bytes.byteLength)
+    const encrypted = await encryptChunkOffThread(bytes.slice(start, end), key, index)
+    onProgress?.({ chunksProcessed: index + 1, totalChunks })
+    yield { index, encrypted, isLast: index === totalChunks - 1 }
+  }
+}
+
+export async function* decryptChunked(getChunk, chunkCount, key, onProgress) {
+  for (let index = 0; index < chunkCount; index += 1) {
+    const packed = await getChunk(index)
+    const plaintext = await decryptChunkOffThread(packed, key, index)
+    onProgress?.({ chunksDecrypted: index + 1, chunkCount })
+    yield plaintext
+  }
+}
+
+export async function* encryptFileChunks(file, key, chunkSize = CHUNK_SIZE, onProgress) {
+  const chunkCount = Math.ceil(file.size / chunkSize)
+
+  for (let index = 0; index < chunkCount; index += 1) {
+    const start = index * chunkSize
+    const end = Math.min(start + chunkSize, file.size)
+    const plaintext = await file.slice(start, end).arrayBuffer()
+    const size = plaintext.byteLength
+    const encrypted = await encryptChunkOffThread(plaintext, key, index)
+    onProgress?.({ chunksProcessed: index + 1, totalChunks: chunkCount })
+    yield {
+      index,
+      encrypted,
+      size,
+      isLast: index === chunkCount - 1,
+    }
+  }
+}
+
+export async function* decryptFileChunks(id, chunkCount, key, fetchChunk, onProgress) {
+  yield* decryptChunked(
+    (index) => fetchChunk(id, index),
+    chunkCount,
     key,
-    ciphertext,
+    onProgress,
   )
 }
 
-/**
- * Async generator to yield encrypted chunks from a File/Blob.
- *
- * @param {File|Blob} file — full file/blob to encrypt
- * @param {CryptoKey} key — AES-256 key
- * @param {number} chunkSize — chunk size in bytes
- * @returns {AsyncGenerator<{ index: number, encrypted: ArrayBuffer, size: number }>}
- */
-export async function* encryptFileChunks(file, key, chunkSize) {
-  const totalSize = file.size
-  const chunkCount = Math.ceil(totalSize / chunkSize)
-  for (let i = 0; i < chunkCount; i++) {
-    const start = i * chunkSize
-    const end = Math.min(start + chunkSize, totalSize)
-    const chunk = file.slice(start, end)
-    const chunkBuffer = await chunk.arrayBuffer()
-    const encrypted = await encryptChunk(chunkBuffer, key, i)
-    yield { index: i, encrypted, size: chunkBuffer.byteLength }
+async function decryptCurrentChunk(bytes, key, expectedIndex) {
+  const aad = bytes.slice(0, INDEX_BYTES)
+  const storedIndex = new DataView(aad.buffer, aad.byteOffset, aad.byteLength)
+    .getUint32(0, false)
+  if (storedIndex !== expectedIndex) {
+    throw new Error(`Encrypted chunk index mismatch: expected ${expectedIndex}`)
   }
+
+  return crypto.subtle.decrypt(
+    {
+      name: 'AES-GCM',
+      iv: bytes.slice(INDEX_BYTES, INDEX_BYTES + NONCE_BYTES),
+      tagLength: 128,
+      additionalData: aad,
+    },
+    key,
+    bytes.slice(INDEX_BYTES + NONCE_BYTES),
+  )
 }
 
-/**
- * Async generator to yield decrypted chunks.
- *
- * @param {string} id — 16-hex file id
- * @param {number} chunkCount — total number of chunks
- * @param {CryptoKey} key — AES-256 key
- * @param {(id: string, index: number) => Promise<ArrayBuffer>} fetchChunk — function to fetch raw chunk bytes
- * @returns {AsyncGenerator<ArrayBuffer>}
- */
-export async function* decryptFileChunks(id, chunkCount, key, fetchChunk) {
-  for (let i = 0; i < chunkCount; i++) {
-    const encryptedChunk = await fetchChunk(id, i)
-    const decrypted = await decryptChunk(encryptedChunk, key, i)
-    yield decrypted
+function decryptLegacyChunk(bytes, key, expectedIndex) {
+  return crypto.subtle.decrypt(
+    {
+      name: 'AES-GCM',
+      iv: bytes.slice(0, NONCE_BYTES),
+      tagLength: 128,
+      additionalData: encodeIndex(expectedIndex),
+    },
+    key,
+    bytes.slice(NONCE_BYTES),
+  )
+}
+
+function encodeIndex(index) {
+  if (!Number.isInteger(index) || index < 0 || index > 0xffffffff) {
+    throw new RangeError('Chunk index must be a uint32')
   }
+  const aad = new Uint8Array(INDEX_BYTES)
+  new DataView(aad.buffer).setUint32(0, index, false)
+  return aad
+}
+
+function encryptChunkOffThread(bytes, key, index) {
+  if (!isCryptoPoolSupported()) return encryptChunk(bytes, key, index)
+  return encryptChunkWithPool(bytes, key, index)
+}
+
+function decryptChunkOffThread(bytes, key, index) {
+  if (!isCryptoPoolSupported()) return decryptChunk(bytes, key, index)
+  return decryptChunkWithPool(bytes, key, index)
+}
+
+function toUint8Array(value) {
+  if (value instanceof Uint8Array) return value
+  if (value instanceof ArrayBuffer) return new Uint8Array(value)
+  if (ArrayBuffer.isView(value)) {
+    return new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+  }
+  throw new TypeError('Expected an ArrayBuffer or typed array')
 }

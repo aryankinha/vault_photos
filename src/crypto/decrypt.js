@@ -1,5 +1,8 @@
-import { decryptWithPool as poolDecrypt } from '../workers/cryptoWorkerPool'
-import { getActiveKey } from './keyDerivation'
+import {
+  decryptWithPool as poolDecrypt,
+  isCryptoPoolSupported,
+} from '../workers/cryptoWorkerPool.js'
+import { getActiveKey } from './keyDerivation.js'
 
 const NONCE_BYTES = 12
 
@@ -31,7 +34,7 @@ export async function decryptPacked(buffer, key) {
  * @param {ArrayBuffer|Uint8Array} buffer — packed [nonce | ciphertext+tag]
  * @returns {Promise<ArrayBuffer>} — plaintext
  */
-export async function decryptPackedOffThread(buffer) {
+export async function decryptPackedOffThread(buffer, key = getActiveKey()) {
   // Always work with an ArrayBuffer for transfer.
   let buf
   if (buffer instanceof ArrayBuffer) {
@@ -42,10 +45,6 @@ export async function decryptPackedOffThread(buffer) {
   } else {
     buf = buffer
   }
-  try {
-    return await poolDecrypt(buf)
-  } catch {
-    // Pool not initialised or key not set — fall back to main thread.
-    return decryptPacked(buf, getActiveKey())
-  }
+  if (!isCryptoPoolSupported()) return decryptPacked(buf, key)
+  return poolDecrypt(buf, key)
 }

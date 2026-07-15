@@ -1,4 +1,5 @@
 import { Check, Loader2, X } from 'lucide-react'
+import { getUserErrorMessage } from '../utils/errors'
 
 const STEPS = [
   { key: 'reading', label: 'Reading file' },
@@ -55,7 +56,9 @@ export function UploadProgress({ status, fileName, error, percent }) {
       {failed && (
         <div className="mt-3 flex items-start gap-2 rounded-lg bg-red-500/10 p-2 text-xs text-red-300">
           <X size={14} className="mt-0.5 shrink-0" />
-          <span className="break-words">{error?.message || 'Upload failed'}</span>
+          <span className="break-words">
+            {getUserErrorMessage(error, 'Upload failed. Retry when your connection is stable.')}
+          </span>
         </div>
       )}
     </div>

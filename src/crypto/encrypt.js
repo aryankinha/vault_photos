@@ -1,5 +1,8 @@
-import { encryptWithPool as poolEncrypt } from '../workers/cryptoWorkerPool'
-import { getActiveKey } from './keyDerivation'
+import {
+  encryptWithPool as poolEncrypt,
+  isCryptoPoolSupported,
+} from '../workers/cryptoWorkerPool.js'
+import { getActiveKey } from './keyDerivation.js'
 
 const NONCE_BYTES = 12
 
@@ -34,14 +37,10 @@ export async function encryptPacked(buffer, key) {
  * @param {ArrayBuffer|Uint8Array} buffer — plaintext to encrypt
  * @returns {Promise<ArrayBuffer>} — [nonce | ciphertext+tag]
  */
-export async function encryptPackedOffThread(buffer) {
+export async function encryptPackedOffThread(buffer, key = getActiveKey()) {
   const buf = buffer instanceof ArrayBuffer ? buffer : buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength)
-  try {
-    return await poolEncrypt(buf)
-  } catch {
-    // Pool not initialised or key not set — fall back to main thread.
-    return encryptPacked(buf, getActiveKey())
-  }
+  if (!isCryptoPoolSupported()) return encryptPacked(buf, key)
+  return poolEncrypt(buf, key)
 }
 
 /**
@@ -52,9 +51,6 @@ export async function encryptPackedOffThread(buffer) {
  * @param {CryptoKey} [_key] — ignored; pool uses the active key from keyDerivation
  * @returns {Promise<ArrayBuffer>}
  */
-export async function encryptWithPool(buffer, /* key intentionally unused; pool reads active key */
-  // eslint-disable-next-line no-unused-vars
-  _key) {
-  return encryptPackedOffThread(buffer)
+export async function encryptWithPool(buffer, key = getActiveKey()) {
+  return encryptPackedOffThread(buffer, key)
 }
-
