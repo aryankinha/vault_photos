@@ -234,7 +234,8 @@ export function UploadProvider({ children }) {
       }
     } catch (error) {
       if (generation !== uploadGenerationRef.current) return
-      resumeAttemptedRef.current = false
+      // Do NOT reset resumeAttemptedRef here — if commitBatch returns 502 we
+      // must not restart the whole loop. The user must explicitly retry.
       setBatchProgress({
         totalFiles: 1,
         completedFiles: 1,

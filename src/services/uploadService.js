@@ -291,7 +291,21 @@ export async function resumeQueuedUploads(onBatchProgress, optimisticCallbacks =
     errors,
   })
 
-  const entries = await finalizeUploads(succeeded, uploadResults, items)
+  let entries
+  try {
+    entries = await finalizeUploads(succeeded, uploadResults, items)
+  } catch (reason) {
+    // commitBatch returned a non-OK status (e.g. 502). Mark every item that
+    // had a successful file upload as failed so the UI shows an error card
+    // instead of looping forever.
+    const error = normalizeError(reason, 'Unable to finalize the vault update — server error')
+    for (const item of succeeded) {
+      errors.push({ file: item.file, error })
+      optimisticCallbacks.markOptimisticError?.(item.id, error.message)
+    }
+    return { entries: [], errors }
+  }
+
   for (const item of succeeded) {
     await dequeueUpload(item.id).catch(() => {})
     optimisticCallbacks.updateOptimisticState?.(item.id, {
