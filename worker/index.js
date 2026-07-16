@@ -1,3 +1,5 @@
+import { planCommitBatches } from './commitPlan.js'
+
 /**
  * VaultPhotos Cloudflare Worker
  *
@@ -7,7 +9,8 @@
  * (not base64) so we stay well under the CF Worker body limit and avoid 33%
  * inflation. The worker base64-encodes internally only when HF's git commit
  * endpoint requires it (manifest, bundle, salt — all small). Media files route
- * through LFS as raw bytes.
+ * through LFS as fixed-length streams using browser-computed ciphertext hashes,
+ * so the Worker does not retain another whole media buffer in memory.
  *
  * HF wire format verified against @huggingface/hub source (commit + LFS batch).
  */
@@ -16,11 +19,12 @@ const HF_API = 'https://huggingface.co'
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type',
+  'Access-Control-Allow-Headers': 'Content-Type, X-Vault-SHA256, X-Vault-Size',
   'Access-Control-Max-Age': '86400',
 }
 // files/** are stored via LFS so large videos don't bloat the git repo.
 const GITATTRIBUTES_CONTENT = 'files/** filter=lfs diff=lfs merge=lfs -text\n'
+const COMMIT_RETRY_DELAYS_MS = [300, 900, 1800]
 
 export default {
   async fetch(request, env) {
@@ -63,9 +67,14 @@ export default {
       console.error('VaultPhotos storage request failed', {
         status,
         route: url.pathname,
+        code: error.code || 'STORAGE_FAILED',
+        upstreamStatus: error.upstreamStatus || null,
       })
       return json({
-        error: status === 404 ? 'Not found' : 'Storage request failed',
+        error: publicStorageError(error, status),
+        code: error.code || (status === 404 ? 'NOT_FOUND' : 'STORAGE_FAILED'),
+        retryable: Boolean(error.retryable),
+        ...(error.upstreamStatus ? { upstreamStatus: error.upstreamStatus } : {}),
       }, status)
     }
   },
@@ -182,10 +191,12 @@ async function uploadFile({ request, url, env }) {
   }
   const commit = url.searchParams.get('commit') !== 'false'
 
-  const bytes = await readRawBody(request)
   const path = `files/${id}.enc`
   await ensureGitAttributes(env)
-  const result = await hfUploadFile(env, path, bytes, commit)
+  const descriptor = readUploadDescriptor(request)
+  const result = descriptor
+    ? await hfUploadStream(env, path, request.body, descriptor.size, descriptor.oid, commit)
+    : await hfUploadFile(env, path, await readRawBody(request), commit)
   return json({ ok: true, id, sha256: result.oid, size: result.size }, 200)
 }
 
@@ -317,15 +328,7 @@ async function commitUpload({ request, env }) {
     }),
   ].join('\n')
 
-  const commitRes = await fetch(
-    `${HF_API}/api/datasets/${env.HF_REPO}/commit/main`,
-    {
-      method: 'POST',
-      headers: authHeaders(env, { 'Content-Type': 'application/x-ndjson' }),
-      body: ndjson,
-    },
-  )
-  if (!commitRes.ok) throw await hfError(commitRes, `commit lfs ${path}`)
+  await postHfCommit(env, ndjson, `commit lfs ${path}`)
   return json({ ok: true }, 200)
 }
 
@@ -419,6 +422,24 @@ async function commitBatch({ request, env }) {
 }
 
 async function hfGitCommitBatch(env, summary, filesToCommit, lfsFilesToCommit) {
+  const batches = planCommitBatches(filesToCommit, lfsFilesToCommit)
+  let result = null
+
+  for (let index = 0; index < batches.length; index += 1) {
+    const batch = batches[index]
+    const suffix = batches.length > 1 ? ` (${index + 1}/${batches.length})` : ''
+    result = await hfGitCommitOnce(
+      env,
+      `${summary}${suffix}`,
+      batch.filesToCommit,
+      batch.lfsFilesToCommit,
+    )
+  }
+
+  return result
+}
+
+async function hfGitCommitOnce(env, summary, filesToCommit, lfsFilesToCommit) {
   const lines = []
   lines.push(JSON.stringify({ key: 'header', value: { summary } }))
 
@@ -442,13 +463,7 @@ async function hfGitCommitBatch(env, summary, filesToCommit, lfsFilesToCommit) {
 
   const ndjson = lines.join('\n')
 
-  const res = await fetch(`${HF_API}/api/datasets/${env.HF_REPO}/commit/main`, {
-    method: 'POST',
-    headers: authHeaders(env, { 'Content-Type': 'application/x-ndjson' }),
-    body: ndjson,
-  })
-  if (!res.ok) throw await hfError(res, `commit-batch`)
-  return res.json()
+  return postHfCommit(env, ndjson, 'commit-batch')
 }
 
 async function listFiles({ env }) {
@@ -530,10 +545,12 @@ async function uploadChunkHandler({ request, url, env }) {
   }
   const commit = url.searchParams.get('commit') !== 'false'
 
-  const bytes = await readRawBody(request)
   const path = `files/${id}_chunk_${index}.enc`
   await ensureGitAttributes(env)
-  const result = await hfUploadFile(env, path, bytes, commit)
+  const descriptor = readUploadDescriptor(request)
+  const result = descriptor
+    ? await hfUploadStream(env, path, request.body, descriptor.size, descriptor.oid, commit)
+    : await hfUploadFile(env, path, await readRawBody(request), commit)
   return json({ ok: true, id, index, sha256: result.oid, size: result.size }, 200)
 }
 
@@ -599,16 +616,115 @@ async function hfGitCommit(env, path, bytes, summary) {
     }),
   ].join('\n')
 
-  const res = await fetch(
-    `${HF_API}/api/datasets/${env.HF_REPO}/commit/main`,
+  return postHfCommit(env, ndjson, `commit ${path}`)
+}
+
+/**
+ * Stream an encrypted request body into its LFS upload target. The browser
+ * supplies the SHA-256 and exact size of ciphertext that it already holds;
+ * FixedLengthStream preserves Content-Length for signed object-storage PUTs
+ * without buffering another copy inside the Worker isolate.
+ */
+async function hfUploadStream(env, path, source, size, oid, commit = true) {
+  if (!source) throw storageError('UPLOAD_BODY_MISSING', 'Upload body is missing', false)
+
+  const object = await requestLfsUpload(env, path, oid, size)
+  const upload = object.actions && object.actions.upload
+
+  if (upload) {
+    let body = source
+    let pipePromise = null
+
+    if (typeof globalThis.FixedLengthStream === 'function') {
+      const fixed = new globalThis.FixedLengthStream(size)
+      body = fixed.readable
+      pipePromise = source.pipeTo(fixed.writable).then(
+        () => null,
+        (error) => error,
+      )
+    }
+
+    let putRes
+    try {
+      putRes = await fetch(upload.href, {
+        method: 'PUT',
+        headers: upload.header || {},
+        body,
+      })
+      const pipeError = pipePromise ? await pipePromise : null
+      if (pipeError) throw pipeError
+    } catch (cause) {
+      if (pipePromise) await pipePromise
+      throw storageError('LFS_UPLOAD_FAILED', 'Encrypted object upload failed', true, cause)
+    }
+
+    if (!putRes.ok) throw await hfError(putRes, `lfs put ${path}`)
+    const verify = object.actions && object.actions.verify
+    if (verify) await verifyLfsUpload(verify, oid, size, path)
+  } else {
+    await source.cancel().catch(() => {})
+  }
+
+  if (commit) await commitLfsPointer(env, path, oid, size)
+  return { oid, size }
+}
+
+async function requestLfsUpload(env, path, oid, size) {
+  const batchRes = await fetch(
+    `${HF_API}/datasets/${env.HF_REPO.replace(/\//g, '/')}.git/info/lfs/objects/batch`,
     {
       method: 'POST',
-      headers: authHeaders(env, { 'Content-Type': 'application/x-ndjson' }),
-      body: ndjson,
+      headers: authHeaders(env, {
+        Accept: 'application/vnd.git-lfs+json',
+        'Content-Type': 'application/vnd.git-lfs+json',
+      }),
+      body: JSON.stringify({
+        operation: 'upload',
+        transfers: ['basic'],
+        hash_algo: 'sha_256',
+        ref: { name: 'main' },
+        objects: [{ oid, size }],
+      }),
     },
   )
-  if (!res.ok) throw await hfError(res, `commit ${path}`)
-  return res.json()
+  if (!batchRes.ok) throw await hfError(batchRes, `lfs batch ${path}`)
+
+  const batch = await batchRes.json()
+  const object = batch.objects && batch.objects[0]
+  if (!object) {
+    throw storageError('LFS_RESPONSE_INVALID', 'Storage returned an invalid upload response', true)
+  }
+  if (object.error) {
+    throw storageError('LFS_OBJECT_REJECTED', 'Storage rejected the encrypted object', true)
+  }
+  if (object.oid !== oid || object.size !== size) {
+    throw storageError('LFS_RESPONSE_MISMATCH', 'Storage returned a mismatched upload response', true)
+  }
+  return object
+}
+
+async function verifyLfsUpload(verify, oid, size, path) {
+  const verifyRes = await fetch(verify.href, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/vnd.git-lfs+json',
+      'Content-Type': 'application/vnd.git-lfs+json',
+      ...(verify.header || {}),
+    },
+    body: JSON.stringify({ oid, size }),
+  })
+  if (!verifyRes.ok) throw await hfError(verifyRes, `lfs verify ${path}`)
+}
+
+async function commitLfsPointer(env, path, oid, size) {
+  const ndjson = [
+    JSON.stringify({ key: 'header', value: { summary: `Add ${path}` } }),
+    JSON.stringify({
+      key: 'lfsFile',
+      value: { path, algo: 'sha256', size, oid },
+    }),
+  ].join('\n')
+  return postHfCommit(env, ndjson, `commit lfs ${path}`)
 }
 
 /**
@@ -684,10 +800,7 @@ async function hfUploadFile(env, path, bytes, commit = true) {
     })
     if (!putRes.ok) throw await hfError(putRes, `lfs put ${path}`)
     const verify = object.actions && object.actions.verify
-    if (verify) {
-      // Optional verify call — ignore failures, the commit will catch issues.
-      await fetch(verify.href, { method: 'POST', headers: verify.header || {} }).catch(() => {})
-    }
+    if (verify) await verifyLfsUpload(verify, oid, size, path)
   }
 
   // Commit the LFS pointer.
@@ -700,15 +813,7 @@ async function hfUploadFile(env, path, bytes, commit = true) {
       }),
     ].join('\n')
 
-    const commitRes = await fetch(
-      `${HF_API}/api/datasets/${env.HF_REPO}/commit/main`,
-      {
-        method: 'POST',
-        headers: authHeaders(env, { 'Content-Type': 'application/x-ndjson' }),
-        body: ndjson,
-      },
-    )
-    if (!commitRes.ok) throw await hfError(commitRes, `commit lfs ${path}`)
+    await postHfCommit(env, ndjson, `commit lfs ${path}`)
   }
 
   return { oid, size }
@@ -784,10 +889,75 @@ async function sha256Hex(bytes) {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('')
 }
 
+async function postHfCommit(env, ndjson, context) {
+  let lastError = null
+
+  for (let attempt = 0; attempt <= COMMIT_RETRY_DELAYS_MS.length; attempt += 1) {
+    let response
+    try {
+      response = await fetch(`${HF_API}/api/datasets/${env.HF_REPO}/commit/main`, {
+        method: 'POST',
+        headers: authHeaders(env, { 'Content-Type': 'application/x-ndjson' }),
+        body: ndjson,
+      })
+    } catch (cause) {
+      lastError = storageError('HF_COMMIT_NETWORK', 'Storage commit network failure', true, cause)
+      if (attempt === COMMIT_RETRY_DELAYS_MS.length) throw lastError
+      await delay(COMMIT_RETRY_DELAYS_MS[attempt])
+      continue
+    }
+
+    if (response.ok) return response.json()
+
+    lastError = await hfError(response, context)
+    if (!lastError.retryable || attempt === COMMIT_RETRY_DELAYS_MS.length) {
+      throw lastError
+    }
+    await response.body?.cancel().catch(() => {})
+    await delay(COMMIT_RETRY_DELAYS_MS[attempt])
+  }
+
+  throw lastError || storageError('HF_COMMIT_FAILED', 'Storage commit failed', true)
+}
+
 async function hfError(res, context) {
   const err = new Error(`HF ${res.status} ${context}`)
   err.status = res.status === 404 ? 404 : 502
+  err.upstreamStatus = res.status
+  err.code = context.includes('commit') ? 'HF_COMMIT_FAILED' : 'HF_STORAGE_FAILED'
+  err.retryable = res.status === 409 || res.status === 429 || res.status >= 500
   return err
+}
+
+function readUploadDescriptor(request) {
+  const oid = request.headers.get('X-Vault-SHA256') || ''
+  const size = Number(request.headers.get('X-Vault-Size'))
+  if (!/^[0-9a-f]{64}$/i.test(oid) || !Number.isSafeInteger(size) || size <= 0) {
+    return null
+  }
+  return { oid: oid.toLowerCase(), size }
+}
+
+function storageError(code, message, retryable, cause) {
+  const error = new Error(message, cause ? { cause } : undefined)
+  error.status = 502
+  error.code = code
+  error.retryable = retryable
+  return error
+}
+
+function publicStorageError(error, status) {
+  if (status === 404) return 'Not found'
+  if (error.code === 'HF_COMMIT_FAILED' || error.code === 'HF_COMMIT_NETWORK') {
+    return error.retryable
+      ? 'Storage commit is temporarily unavailable. The encrypted upload can be finalized safely without uploading a duplicate.'
+      : 'Storage rejected the encrypted vault update.'
+  }
+  return 'Storage request failed'
+}
+
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds))
 }
 
 function base64ToBytes(value) {

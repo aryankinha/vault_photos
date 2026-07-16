@@ -1,6 +1,9 @@
 import { useEffect, useState } from 'react'
 import { loadFullMedia } from '../services/viewerService'
-import { createVideoStream, isMseSupported } from '../services/videoStreamService'
+import {
+  createVideoStream,
+  isVideoRangeStreamingSupported,
+} from '../services/videoStreamService'
 import { claimPrefetched } from './usePrefetch'
 
 const claimedPrefetchUrls = new Set()
@@ -18,13 +21,12 @@ const claimedPrefetchUrls = new Set()
  * skips decryption and enters the ready state immediately.  The caller must NOT
  * revoke this URL — the hook takes ownership and revokes on cleanup.
  *
- * Phase 10: for chunked video entries, delegates to createVideoStream() for
- * MSE-based progressive playback.  Falls back to full-assembly Blob if MSE
- * is unsupported or the codec probe fails.  Exposes `streamProgress` (0–1) so
- * callers can render a buffering bar while chunks arrive.
+ * Chunked videos use a service-worker-backed HTTP Range URL, so playback and
+ * seeking authenticate only the needed encrypted chunks. Browsers without
+ * service-worker control retain the full-Blob compatibility path.
  *
  * Return shape: { objectUrl, loading, error, streaming, streamProgress }
- *   streaming      — true while an MSE stream is in progress
+ *   streaming      — true while a service-worker Range stream is active
  *   streamProgress — 0–1 fraction of chunks received (0 until first chunk)
  */
 export function useViewer(entry, prefetchedMedia, reloadKey = 0) {
@@ -74,73 +76,70 @@ export function useViewer(entry, prefetchedMedia, reloadKey = 0) {
       }
     }
 
-    // ── Phase 10: MSE streaming for chunked video ─────────────────────────────
+    // ── Authenticated HTTP Range streaming for chunked video ────────────────
     if (entry.chunked && entry.type === 'video') {
       const mime = inferMimeType(entry)
 
-      if (isMseSupported(mime)) {
-        let mseActive = true
+      if (isVideoRangeStreamingSupported()) {
+        let streamActive = true
+        let activeStream = null
 
-        // Defer initial state updates to microtask (satisfies set-state-in-effect rule)
         Promise.resolve().then(() => {
-          if (!mseActive) return
+          if (!streamActive) return
           setStreamProgress(0)
           setStreaming(true)
+          setState({ entryId: entry.id, loading: true, error: null })
         })
 
-        const stream = createVideoStream(entry, mime, {
-          onProgress: (p) => setStreamProgress(p),
+        createVideoStream(entry, mime, {
+          onProgress: (progress) => {
+            if (streamActive) setStreamProgress(progress)
+          },
+          onError: (error) => {
+            if (!streamActive) return
+            setStreaming(false)
+            setState({ entryId: entry.id, loading: false, error })
+          },
         })
-
-        if (stream) {
-          const cleanupFn = stream.cleanup
-          let fallbackOwnedUrl = null
-          // Hand the URL to the video element via microtask — stream.url is already set.
-          Promise.resolve().then(() => {
-            if (!mseActive) return
+          .then((stream) => {
+            if (!streamActive) {
+              stream?.cleanup()
+              return
+            }
+            if (!stream) return loadFullMedia(entry, mime)
+            activeStream = stream
             setObjectUrl(stream.url)
             setObjectEntryId(entry.id)
             setState({ entryId: entry.id, loading: false, error: null })
           })
-          stream.done
-            .then(() => {
-              if (!mseActive) return
-              setStreaming(false)
-              setStreamProgress(1)
-            })
-            .catch(() => {
-              if (!mseActive) return
-              cleanupFn?.()
-              setStreaming(false)
-              setState({ entryId: entry.id, loading: true, error: null })
-              return loadFullMedia(entry, mime)
-                .then((fallbackUrl) => {
-                  if (!mseActive) {
-                    URL.revokeObjectURL(fallbackUrl)
-                    return
-                  }
-                  fallbackOwnedUrl = fallbackUrl
-                  setObjectUrl(fallbackUrl)
-                  setObjectEntryId(entry.id)
-                  setState({ entryId: entry.id, loading: false, error: null })
-                })
-                .catch((error) => {
-                  if (mseActive) setState({ entryId: entry.id, loading: false, error })
-                })
-            })
-          return () => {
-            mseActive = false
+          .then((fallbackUrl) => {
+            if (!fallbackUrl) return
+            if (!streamActive) {
+              URL.revokeObjectURL(fallbackUrl)
+              return
+            }
+            activeStream = {
+              cleanup: () => URL.revokeObjectURL(fallbackUrl),
+            }
+            setObjectUrl(fallbackUrl)
+            setObjectEntryId(entry.id)
+            setState({ entryId: entry.id, loading: false, error: null })
+            setStreamProgress(1)
             setStreaming(false)
-            cleanupFn?.()
-            if (fallbackOwnedUrl) URL.revokeObjectURL(fallbackOwnedUrl)
-          }
+          })
+          .catch((error) => {
+            if (streamActive) {
+              setStreaming(false)
+              setState({ entryId: entry.id, loading: false, error })
+            }
+          })
+
+        return () => {
+          streamActive = false
+          activeStream?.cleanup()
         }
-        // stream === null means isMseSupported returned true but
-        // createVideoStream returned null (race/unsupported). Fall through.
-        Promise.resolve().then(() => { if (mseActive) setStreaming(false) })
-        mseActive = false
       }
-      // MSE unsupported — fall through to full-assembly path below.
+      // Service workers unavailable: preserve legacy full-Blob compatibility.
     }
 
     // ── Normal decrypt path (single-file or chunked non-video) ───────────────

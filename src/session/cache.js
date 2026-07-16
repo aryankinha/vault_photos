@@ -11,10 +11,9 @@
  *   Bundle    → OPFS first (fast binary I/O), IDB as fallback for older browsers
  *   Thumbs    → IndexedDB 'thumbCache' store (persistent across sessions)
  *
- * V2 adds a separate 'uploadQueue' object store for background sync. Each entry
- * is { id, encryptedBytes, entry } — the already-encrypted file bytes and the
- * manifest entry, persisted before the network upload begins so a service worker
- * can retry them if the tab closes mid-upload.
+ * V2 adds a separate 'uploadQueue' object store for recovery. Small files keep
+ * already-encrypted bytes; chunked files keep completed LFS receipts. Both retain
+ * the original media id so finalization retries are idempotent.
  *
  * V3 adds a 'thumbCache' object store for persistent thumbnail blobs. Decrypted
  * thumbnails survive across sessions so returning users see the gallery
@@ -39,6 +38,7 @@ const BUNDLE_KEY = 'bundle'
 const WORKER_URL_KEY = 'workerUrl'
 const QUEUE_STORE = 'uploadQueue'
 const THUMB_CACHE_STORE = 'thumbCache'
+const BACKGROUND_ATTEMPT_LIMIT = 2
 
 let dbPromise = null
 
@@ -262,8 +262,26 @@ export async function getThumbCacheStats() {
  * @param {object} entry — manifest entry object (without thumb_offset/thumb_length yet)
  * @param {Blob} [thumbnail] — small recovery copy if the persistent thumb cache is unavailable
  */
-export async function queueUpload(id, encryptedBytes, entry, thumbnail) {
-  await (await db()).put(QUEUE_STORE, { id, encryptedBytes, entry, thumbnail })
+export async function queueUpload(id, encryptedBytes, entry, thumbnail, sha256) {
+  await (await db()).put(QUEUE_STORE, {
+    id,
+    encryptedBytes,
+    entry,
+    thumbnail,
+    sha256,
+    backgroundAttempts: 0,
+  })
+}
+
+export async function queueChunkedUpload(id, entry, thumbnail, chunks) {
+  await (await db()).put(QUEUE_STORE, {
+    id,
+    entry,
+    thumbnail,
+    chunked: true,
+    chunks,
+    backgroundAttempts: BACKGROUND_ATTEMPT_LIMIT,
+  })
 }
 
 /**
@@ -280,6 +298,27 @@ export async function dequeueUpload(id) {
  */
 export async function getUploadQueue() {
   return (await db()).getAll(QUEUE_STORE)
+}
+
+export async function getQueuedUpload(id) {
+  return (await db()).get(QUEUE_STORE, id)
+}
+
+export async function clearUploadQueue(ids) {
+  const database = await db()
+  const tx = database.transaction(QUEUE_STORE, 'readwrite')
+  const targets = ids?.length ? ids : await tx.store.getAllKeys()
+  await Promise.all([
+    ...targets.map((id) => tx.store.delete(id)),
+    tx.done,
+  ])
+
+  if (typeof navigator !== 'undefined') {
+    navigator.serviceWorker?.controller?.postMessage({
+      type: 'vault-cancel-uploads',
+      ids: targets,
+    })
+  }
 }
 
 export async function markQueuedUploadUploaded(id, uploaded) {

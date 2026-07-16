@@ -10,14 +10,14 @@
  */
 import { useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { UploadCloud, CheckCircle2, ArrowRight } from 'lucide-react'
+import { UploadCloud, CheckCircle2, ArrowRight, X } from 'lucide-react'
 import { Topbar } from '../components/Topbar'
 import { useUploadContext } from '../context/useUploadContext'
 
 export function Upload() {
   const navigate = useNavigate()
   const inputRef = useRef(null)
-  const { startBatch, isUploading } = useUploadContext()
+  const { startBatch, isUploading, cancelBatch } = useUploadContext()
   const [started, setStarted] = useState(false)
   const [fileCount, setFileCount] = useState(0)
 
@@ -109,6 +109,20 @@ export function Upload() {
             >
               Add more files
             </button>
+
+            {isUploading && (
+              <button
+                id="upload-cancel-btn"
+                type="button"
+                onClick={() => {
+                  cancelBatch()
+                  setStarted(false)
+                }}
+                className="inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-xs font-semibold text-red-300 ring-1 ring-red-500/25 transition hover:bg-red-500/10"
+              >
+                <X size={14} /> Cancel upload
+              </button>
+            )}
           </div>
         )}
       </main>

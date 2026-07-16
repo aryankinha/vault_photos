@@ -74,9 +74,14 @@ export async function initializeVault(saltBytes, manifestBytes, bundlePageBytes)
  * @param {((e: {loaded:number,total:number,percent:number}) => void) | undefined} onProgress
  * @param {boolean} [commit] — whether to commit the file to HF in this request
  */
-export async function uploadFile(id, bytes, onProgress, commit = true) {
+export async function uploadFile(id, bytes, onProgress, commit = true, options = {}) {
   const commitParam = commit ? '' : '&commit=false'
-  return xhrPost(`/upload-file?id=${encodeURIComponent(id)}${commitParam}`, bytes, onProgress)
+  return xhrPost(
+    `/upload-file?id=${encodeURIComponent(id)}${commitParam}`,
+    bytes,
+    onProgress,
+    options,
+  )
 }
 
 /**
@@ -146,12 +151,13 @@ export async function getChunk(id, index) {
  * @param {((e: {loaded:number,total:number,percent:number}) => void) | undefined} onProgress
  * @returns {Promise<ArrayBuffer>}
  */
-export async function uploadChunk(id, index, bytes, onProgress, commit = true) {
+export async function uploadChunk(id, index, bytes, onProgress, commit = true, options = {}) {
   const commitParam = commit ? '' : '&commit=false'
   return xhrPost(
     `/upload-chunk?id=${encodeURIComponent(id)}&index=${index}${commitParam}`,
     bytes,
     onProgress,
+    options,
   )
 }
 
@@ -191,8 +197,8 @@ export async function commitUpload(id, sha256, size, verifyUrl, verifyHeaders) {
  * @param {string} [payload.manifestBytesBase64]
  * @param {string} [payload.bundleBytesBase64]
  */
-export async function commitBatch(payload) {
-  return postJson('/commit-batch', payload)
+export async function commitBatch(payload, options = {}) {
+  return postJson('/commit-batch', payload, options)
 }
 
 // ---------------------------------------------------------------------------
@@ -210,13 +216,25 @@ async function getBytes(path) {
  * Returns the response body as ArrayBuffer (for callers that don't need it,
  * this is fine — same shape as the old postBytes helper returned Response).
  */
-function xhrPost(path, bytes, onProgress) {
+function xhrPost(path, bytes, onProgress, options = {}) {
   const body = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes)
+  const { signal, sha256 } = options
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(createAbortError())
+      return
+    }
+
     const xhr = new XMLHttpRequest()
     xhr.open('POST', `${WORKER_URL}${path}`)
     xhr.setRequestHeader('Content-Type', 'application/octet-stream')
+    xhr.setRequestHeader('X-Vault-Size', String(body.byteLength))
+    if (sha256) xhr.setRequestHeader('X-Vault-SHA256', sha256)
     xhr.responseType = 'arraybuffer'
+
+    const cleanup = () => signal?.removeEventListener('abort', abortUpload)
+    const abortUpload = () => xhr.abort()
+    signal?.addEventListener('abort', abortUpload, { once: true })
 
     if (onProgress) {
       xhr.upload.onprogress = (e) => {
@@ -228,16 +246,27 @@ function xhrPost(path, bytes, onProgress) {
 
     xhr.onload = () => {
       if (xhr.status >= 200 && xhr.status < 300) {
+        cleanup()
         resolve(xhr.response)
       } else {
         // Try to parse JSON error body.
         let message = `POST ${path} failed (${xhr.status})`
+        const details = {}
         try {
-          const body = JSON.parse(new TextDecoder().decode(xhr.response))
-          if (body && body.error) message = body.error
+          const responseBody = JSON.parse(new TextDecoder().decode(xhr.response))
+          if (responseBody && responseBody.error) message = responseBody.error
+          if (responseBody && responseBody.code) details.code = responseBody.code
+          if (responseBody && responseBody.retryable !== undefined) {
+            details.retryable = responseBody.retryable
+          }
+          if (responseBody && responseBody.upstreamStatus) {
+            details.upstreamStatus = responseBody.upstreamStatus
+          }
         } catch { /* ignore */ }
         const err = new Error(message)
         err.status = xhr.status
+        Object.assign(err, details)
+        cleanup()
         reject(err)
       }
     }
@@ -245,7 +274,13 @@ function xhrPost(path, bytes, onProgress) {
     xhr.onerror = () => {
       const err = new Error(`POST ${path} network error`)
       err.status = 0
+      cleanup()
       reject(err)
+    }
+
+    xhr.onabort = () => {
+      cleanup()
+      reject(createAbortError())
     }
 
     xhr.send(body)
@@ -256,11 +291,12 @@ function xhrPost(path, bytes, onProgress) {
  * POST a JSON body and parse the JSON response. Used by the direct-to-S3
  * handshake routes (preauth/commit), which carry only metadata, no file bytes.
  */
-async function postJson(path, payload) {
+async function postJson(path, payload, options = {}) {
   const res = await fetch(`${WORKER_URL}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
+    signal: options.signal,
   })
   if (!res.ok) throw await httpError(res, `POST ${path}`)
   return res.json()
@@ -268,15 +304,24 @@ async function postJson(path, payload) {
 
 async function httpError(res, context) {
   let message = `${context} failed (${res.status})`
+  const errorDetails = {}
   try {
     const body = await res.json()
     if (body && body.error) message = body.error
+    if (body && body.code) errorDetails.code = body.code
+    if (body && body.retryable !== undefined) errorDetails.retryable = body.retryable
+    if (body && body.upstreamStatus) errorDetails.upstreamStatus = body.upstreamStatus
   } catch {
     // Response wasn't JSON — keep the default message.
   }
   const error = new Error(message)
   error.status = res.status
+  Object.assign(error, errorDetails)
   return error
+}
+
+function createAbortError() {
+  return new DOMException('Upload cancelled', 'AbortError')
 }
 
 function bytesToBase64(input) {

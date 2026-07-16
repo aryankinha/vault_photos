@@ -11,10 +11,15 @@
  *   └───────────────────────────────────────────────────────────┘
  */
 import { useUploadContext } from '../context/useUploadContext'
-import { AlertCircle } from 'lucide-react'
+import { AlertCircle, X } from 'lucide-react'
 
 export function PersistentUploadBar() {
-  const { isUploading, batchProgress } = useUploadContext()
+  const {
+    isUploading,
+    batchProgress,
+    cancelBatch,
+    dismissBatchProgress,
+  } = useUploadContext()
 
   if (!isUploading && !batchProgress) return null
 
@@ -34,10 +39,18 @@ export function PersistentUploadBar() {
     overallPercent,
     etaDisplay,
     errors,
+    stage,
   } = progress
 
   const pct = Math.round(overallPercent * 100)
   const errorCount = errors?.length ?? 0
+  const actionLabel = stage === 'reading'
+    ? 'Reading'
+    : stage === 'encrypting'
+      ? 'Encrypting'
+      : stage === 'waiting'
+        ? 'Waiting to upload'
+        : 'Uploading'
 
   return (
     <div
@@ -51,7 +64,7 @@ export function PersistentUploadBar() {
         <span className="truncate max-w-[60%]">
           {currentFile ? (
             <>
-              Uploading{' '}
+              {actionLabel}{' '}
               <span className="font-medium text-neutral-100">{currentFile}</span>
               {totalFiles > 1 && (
                 <span className="ml-1 text-neutral-500">
@@ -59,6 +72,10 @@ export function PersistentUploadBar() {
                 </span>
               )}
             </>
+          ) : stage === 'cancelled' ? (
+            <span className="text-neutral-300">Upload cancelled</span>
+          ) : stage === 'error' ? (
+            <span className="text-red-300">Upload needs attention</span>
           ) : (
             <span className="text-neutral-400">Finalising…</span>
           )}
@@ -73,6 +90,17 @@ export function PersistentUploadBar() {
               <AlertCircle size={10} />
               {errorCount} failed
             </span>
+          )}
+          {(isUploading || errorCount > 0 || stage === 'cancelled') && (
+            <button
+              type="button"
+              onClick={isUploading ? cancelBatch : dismissBatchProgress}
+              className="inline-flex h-7 items-center gap-1 rounded-md px-2 text-[10px] font-semibold text-neutral-300 ring-1 ring-white/15 transition hover:bg-white/10 hover:text-white"
+              aria-label={isUploading ? 'Cancel uploads' : 'Dismiss upload status'}
+            >
+              <X size={12} />
+              {isUploading ? 'Cancel' : 'Dismiss'}
+            </button>
           )}
         </div>
       </div>

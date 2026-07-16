@@ -56,7 +56,7 @@ export function Viewer() {
           Back
         </button>
         <span className="truncate text-xs text-neutral-400">{entry?.name}</span>
-        {streaming && streamProgress < 1 && (
+        {streaming && readyVideoUrl !== objectUrl && (
           <span className="ml-auto flex items-center gap-1.5 text-[10px] text-neutral-500">
             <Loader2 size={11} className="animate-spin" />
             Buffering {Math.round(streamProgress * 100)}%
@@ -99,7 +99,7 @@ export function Viewer() {
                     <Loader2 size={24} className="animate-spin text-neutral-500" />
                   </div>
                 )}
-                {streaming && streamProgress < 1 && (
+                {streaming && readyVideoUrl !== objectUrl && (
                   <div className="absolute bottom-0 left-0 h-[3px] w-full overflow-hidden rounded-b-lg bg-white/10">
                     <div
                       className="h-full bg-sky-500 transition-[width] duration-300"

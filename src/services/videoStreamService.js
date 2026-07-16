@@ -1,261 +1,137 @@
 /**
- * videoStreamService.js — Phase 10: Chunked video streaming via MediaSource API.
+ * Format-agnostic chunked video streaming.
  *
- * Architecture
- * ────────────────────────────────────────────────────────────────────────────
- * For video files stored as AES-GCM chunks (entry.chunked === true), instead
- * of decrypting every chunk into RAM and then creating one giant Blob URL
- * (which blocks until all crypto is done), we:
- *
- *   1. Create a MediaSource instance and get its object URL immediately.
- *   2. Listen for 'sourceopen', then open a SourceBuffer for the video codec.
- *   3. Decrypt chunks one-by-one via the decryptFileChunks generator and
- *      append each to the SourceBuffer as it arrives.
- *   4. Call mediaSource.endOfStream() when the last chunk is appended.
- *
- * This lets the <video> element start rendering the first frame as soon as
- * chunk 0 is decrypted, while remaining chunks arrive progressively.
- *
- * Codec support
- * ────────────────────────────────────────────────────────────────────────────
- * MSE requires the video data to be in a "byte-stream" format it understands.
- * In practice this means:
- *   • fragmented MP4 (fMP4)   — most modern devices/encoders
- *   • WebM (VP8/VP9/AV1)      — Chromium-based browsers only for VP8/VP9
- *
- * For regular (non-fragmented) MP4 files, MSE may fail or stall until the
- * moov atom arrives. createVideoStream() returns null in that case so the
- * caller can fall back gracefully to the full-assembly Blob path.
- *
- * Cleanup
- * ────────────────────────────────────────────────────────────────────────────
- * The returned `cleanup()` function MUST be called when the component unmounts
- * or the user navigates away. It aborts any in-flight decryption and revokes
- * the object URL.
+ * A same-origin virtual URL is handled by the service worker. Native video
+ * Range requests are mapped to encrypted HF chunks, authenticated with
+ * AES-GCM in service-worker RAM, and returned as 206 responses. This supports
+ * ordinary MP4/MOV/WebM files without pretending raw file slices are MSE
+ * segments and never assembles the whole video in window memory.
  */
 
-import { decryptFileChunks } from '../crypto/chunkEncrypt'
 import { getActiveKey } from '../crypto/keyDerivation'
-import * as worker from '../storage/workerClient'
 
-// ─── Codec probing ────────────────────────────────────────────────────────────
+const WORKER_URL = import.meta.env.VITE_WORKER_URL
+const STREAM_PATH_PREFIX = '/__vault_stream__/'
+const SERVICE_WORKER_READY_TIMEOUT_MS = 3000
+const activeStreams = new Map()
 
-/**
- * Ordered list of MIME type + codec strings to probe.
- * We try the most-specific string first and fall back to the base type.
- * isTypeSupported() is synchronous and cheap.
- */
-const MSE_PROBE_TYPES = [
-  'video/mp4',
-  // fMP4 — H.264 baseline + AAC (widest support)
-  'video/mp4; codecs="avc1.42E01E,mp4a.40.2"',
-  // fMP4 — H.264 high + AAC
-  'video/mp4; codecs="avc1.640028,mp4a.40.2"',
-  'video/webm',
-  // WebM — VP9 + Opus (Chrome/Edge/Firefox)
-  'video/webm; codecs="vp9,opus"',
-  // WebM — VP8 + Vorbis
-  'video/webm; codecs="vp8,vorbis"',
-]
+export async function createVideoStream(entry, mimeType, callbacks = {}) {
+  if (!isVideoRangeStreamingSupported()) return null
 
-/**
- * Find the first MIME+codec string that both matches the caller's base MIME
- * type and is supported by this browser's MSE implementation.
- *
- * @param {string} mimeType — e.g. "video/mp4" or "video/webm"
- * @returns {string|null}
- */
-function resolveSourceBufferType(mimeType) {
-  if (typeof window === 'undefined' || !window.MediaSource) return null
-  const base = (mimeType || 'video/mp4').split(';')[0].trim()
-  for (const candidate of MSE_PROBE_TYPES) {
-    if (candidate.startsWith(base) && MediaSource.isTypeSupported(candidate)) {
-      return candidate
+  const controller = await getServiceWorkerController()
+  if (!controller) return null
+
+  const sessionId = createSessionId()
+  const url = `${window.location.origin}${STREAM_PATH_PREFIX}${sessionId}`
+  let cleaned = false
+
+  const onMessage = (event) => {
+    const message = event.data || {}
+    if (message.sessionId !== sessionId) return
+    if (message.type === 'vault-stream-progress') {
+      callbacks.onProgress?.(message.progress)
+    }
+    if (message.type === 'vault-stream-error') {
+      callbacks.onError?.(new Error(message.error || 'Encrypted video stream failed'))
     }
   }
-  return null
-}
+  navigator.serviceWorker.addEventListener('message', onMessage)
 
-// ─── MSE streaming engine ─────────────────────────────────────────────────────
-
-/**
- * Create a MediaSource-backed streaming video URL for a chunked entry.
- *
- * @param {object} entry       — manifest entry (must have id, chunk_count)
- * @param {string} mimeType    — inferred mime type (e.g. "video/mp4")
- * @param {object} callbacks   — optional
- * @param {(progress: number) => void} callbacks.onProgress — called with 0–1 as each chunk arrives
- * @param {(err: Error) => void}       callbacks.onError    — called if streaming fails after start
- *
- * @returns {{ url: string, cleanup: () => void } | null}
- *   Returns null if MSE is unavailable or the codec is unsupported (caller
- *   should fall back to full-assembly Blob path).
- */
-export function createVideoStream(entry, mimeType, callbacks = {}) {
-  if (typeof window === 'undefined' || !window.MediaSource) return null
-
-  const sourceBufferType = resolveSourceBufferType(mimeType)
-  if (!sourceBufferType) return null
-
-  const { onProgress } = callbacks
-  const mediaSource = new MediaSource()
-  const url = URL.createObjectURL(mediaSource)
-
-  let aborted = false
-  let sourceBuffer = null
-  let settled = false
-  let resolveDone
-  let rejectDone
-  const done = new Promise((resolve, reject) => {
-    resolveDone = resolve
-    rejectDone = reject
-  })
-
-  // ── Helper: wait for SourceBuffer to finish processing an appendBuffer ────
-  function waitForUpdateEnd() {
-    return new Promise((resolve, reject) => {
-      function cleanup() {
-        sourceBuffer.removeEventListener('updateend', onEnd)
-        sourceBuffer.removeEventListener('error', onErr)
-        sourceBuffer.removeEventListener('abort', onAbort)
-      }
-      function onEnd() {
-        cleanup()
-        resolve()
-      }
-      function onErr(e) {
-        cleanup()
-        reject(new Error(`SourceBuffer error: ${e.type}`))
-      }
-      function onAbort() {
-        cleanup()
-        reject(new Error('SourceBuffer append aborted'))
-      }
-      sourceBuffer.addEventListener('updateend', onEnd)
-      sourceBuffer.addEventListener('error', onErr)
-      sourceBuffer.addEventListener('abort', onAbort)
+  try {
+    await postWithAck(controller, {
+      type: 'vault-stream-register',
+      sessionId,
+      entry: {
+        id: entry.id,
+        size: entry.size,
+        chunk_size: entry.chunk_size,
+        chunk_count: entry.chunk_count,
+      },
+      mimeType,
+      workerUrl: WORKER_URL,
+      key: getActiveKey(),
     })
+  } catch (error) {
+    navigator.serviceWorker.removeEventListener('message', onMessage)
+    throw error
   }
 
-  function appendBuffer(buffer) {
-    return new Promise((resolve, reject) => {
-      const cleanup = () => {
-        sourceBuffer.removeEventListener('updateend', onEnd)
-        sourceBuffer.removeEventListener('error', onError)
-        sourceBuffer.removeEventListener('abort', onAbort)
-      }
-      const onEnd = () => {
-        cleanup()
-        resolve()
-      }
-      const onError = (event) => {
-        cleanup()
-        reject(new Error(`SourceBuffer error: ${event.type}`))
-      }
-      const onAbort = () => {
-        cleanup()
-        reject(new Error('SourceBuffer append aborted'))
-      }
-
-      sourceBuffer.addEventListener('updateend', onEnd)
-      sourceBuffer.addEventListener('error', onError)
-      sourceBuffer.addEventListener('abort', onAbort)
-      try {
-        sourceBuffer.appendBuffer(buffer)
-      } catch (error) {
-        cleanup()
-        reject(new Error(`Unable to append video segment: ${error.name}`, {
-          cause: error,
-        }))
-      }
-    })
-  }
-
-  // ── Main streaming coroutine — runs when MediaSource is open ──────────────
-  async function stream() {
-    try {
-      sourceBuffer = mediaSource.addSourceBuffer(sourceBufferType)
-    } catch (err) {
-      // addSourceBuffer can throw if the type was accepted by isTypeSupported
-      // but the actual data format is wrong (e.g. non-fragmented MP4).
-      if (mediaSource.readyState === 'open') mediaSource.endOfStream('decode')
-      settled = true
-      rejectDone(err)
-      return
-    }
-
-    const total = entry.chunk_count
-    let done = 0
-
-    try {
-      for await (const decryptedChunk of decryptFileChunks(
-        entry.id,
-        total,
-        getActiveKey(),
-        worker.getChunk,
-      )) {
-        if (aborted) break
-
-        // Wait if SourceBuffer is still processing the previous appendBuffer.
-        if (sourceBuffer.updating) await waitForUpdateEnd()
-        if (aborted) break
-
-        await appendBuffer(decryptedChunk)
-
-        done++
-        onProgress?.(done / total)
-      }
-    } catch (err) {
-      if (!aborted) {
-        settled = true
-        rejectDone(err)
-      }
-      return
-    }
-
-    if (!aborted && mediaSource.readyState === 'open') {
-      // Ensure no pending update before calling endOfStream
-      if (sourceBuffer?.updating) await waitForUpdateEnd().catch(() => {})
-      try { mediaSource.endOfStream() } catch { /* already ended or aborted */ }
-      settled = true
-      resolveDone()
-    }
-  }
-
-  mediaSource.addEventListener('sourceopen', () => {
-    void stream()
-  }, { once: true })
-
-  // ── Cleanup — abort in-flight streaming and revoke URL ────────────────────
   function cleanup() {
-    aborted = true
-    if (!settled) {
-      settled = true
-      rejectDone(new Error('Video stream cancelled'))
-    }
-    // Abort any pending SourceBuffer operation so the coroutine unblocks.
-    try {
-      if (sourceBuffer && mediaSource.readyState === 'open' && sourceBuffer.updating) {
-        sourceBuffer.abort()
-      }
-    } catch { /* ignore */ }
-    // End the MediaSource so the <video> element releases it.
-    try {
-      if (mediaSource.readyState === 'open') mediaSource.endOfStream()
-    } catch { /* already ended */ }
-    URL.revokeObjectURL(url)
+    if (cleaned) return
+    cleaned = true
+    navigator.serviceWorker.removeEventListener('message', onMessage)
+    navigator.serviceWorker.controller?.postMessage({
+      type: 'vault-stream-remove',
+      sessionId,
+    })
+    activeStreams.delete(sessionId)
   }
 
-  return { url, done, cleanup }
+  activeStreams.set(sessionId, cleanup)
+  return { url, cleanup }
 }
 
-/**
- * Returns true if MediaSource streaming is available and likely to work for
- * the given mimeType.  Use for feature-detection before calling createVideoStream.
- *
- * @param {string} mimeType
- * @returns {boolean}
- */
-export function isMseSupported(mimeType) {
-  return resolveSourceBufferType(mimeType) !== null
+// Kept under the existing export name so callers and old tests remain source
+// compatible; the implementation now probes service-worker Range streaming.
+export function isVideoRangeStreamingSupported() {
+  return (
+    typeof window !== 'undefined' &&
+    'serviceWorker' in navigator &&
+    Boolean(WORKER_URL)
+  )
+}
+
+export const isMseSupported = isVideoRangeStreamingSupported
+
+export function clearVideoStreams() {
+  for (const cleanup of [...activeStreams.values()]) cleanup()
+  navigator.serviceWorker?.controller?.postMessage({ type: 'vault-stream-clear' })
+}
+
+async function getServiceWorkerController() {
+  const registration = await Promise.race([
+    navigator.serviceWorker.ready,
+    delay(SERVICE_WORKER_READY_TIMEOUT_MS, null),
+  ])
+  if (!registration) return null
+  if (navigator.serviceWorker.controller) return navigator.serviceWorker.controller
+
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      navigator.serviceWorker.removeEventListener('controllerchange', onChange)
+      resolve(null)
+    }, 3000)
+    const onChange = () => {
+      clearTimeout(timeout)
+      navigator.serviceWorker.removeEventListener('controllerchange', onChange)
+      resolve(navigator.serviceWorker.controller)
+    }
+    navigator.serviceWorker.addEventListener('controllerchange', onChange)
+  })
+}
+
+function delay(milliseconds, value) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds, value))
+}
+
+function postWithAck(controller, message) {
+  return new Promise((resolve, reject) => {
+    const channel = new MessageChannel()
+    const timeout = setTimeout(() => {
+      channel.port1.close()
+      reject(new Error('Video stream worker did not respond'))
+    }, 5000)
+
+    channel.port1.onmessage = (event) => {
+      clearTimeout(timeout)
+      channel.port1.close()
+      if (event.data?.ok) resolve()
+      else reject(new Error(event.data?.error || 'Unable to initialize video stream'))
+    }
+    controller.postMessage(message, [channel.port2])
+  })
+}
+
+function createSessionId() {
+  return crypto.randomUUID().replace(/-/g, '')
 }

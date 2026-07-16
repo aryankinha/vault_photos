@@ -57,4 +57,7 @@ export function hasActiveKey() {
 
 export function clearActiveKey() {
   activeKey = null
+  if (typeof navigator !== 'undefined') {
+    navigator.serviceWorker?.controller?.postMessage({ type: 'vault-stream-clear' })
+  }
 }

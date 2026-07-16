@@ -22,10 +22,20 @@ Hugging Face Dataset repo (stores only encrypted blobs)
   → 256-bit AES key. The key lives only in a module-level JS variable in RAM.
   Refreshing the page clears it and asks for the passphrase again.
 - **Encryption:** AES-256-GCM via Web Crypto. Non-chunked objects keep the V1
-  `[12-byte nonce][ciphertext+16-byte tag]` format. Files at least 50 MiB use
-  independently authenticated 32 MiB chunks with the chunk index as AAD.
+  `[12-byte nonce][ciphertext+16-byte tag]` format. New videos and files at
+  least 50 MiB use independently authenticated 8 MiB chunks with the chunk
+  index as AAD. Existing 32 MiB V3 chunks remain compatible.
 - **Responsiveness:** A pool of up to four module workers performs transferable
-  file/chunk crypto away from the UI thread.
+  file/chunk crypto away from the UI thread. Local preparation overlaps a
+  bounded network pipeline and two video chunks can transfer concurrently.
+- **Video playback:** the service worker answers native HTTP Range requests
+  from a same-origin virtual media URL. It fetches and authenticates only the
+  encrypted chunks needed for playback or seeking; the full video is never
+  assembled in window memory.
+- **Recovery controls:** interrupted transactions remain under the original
+  media ID and are shown as paused after unlock. Resume is explicit; Discard or
+  Cancel removes the queue. Background Sync processes at most three encrypted
+  objects per event and never publishes the manifest by itself.
 - **Storage layout in HF:**
   - `salt.bin` — Argon2 salt (16 bytes)
   - `manifest.enc` — encrypted gzip JSON index (old plain JSON still loads)
@@ -85,7 +95,9 @@ npx wrangler secret put HF_REPO
 
 Vault creation atomically commits the salt, encrypted empty manifest, and empty
 thumbnail page. The first media upload also initializes `.gitattributes` so
-`files/**` is stored via LFS.
+`files/**` is stored via LFS. Large finalizations are split into bounded pointer
+commits, with the encrypted manifest and thumbnail page published only in the
+last commit.
 
 Smoke-test the worker (should return 404 on a fresh repo, meaning "no salt yet"):
 
@@ -118,6 +130,12 @@ redeploy. The build inserts that origin into the Content Security Policy;
 changing it therefore requires a rebuild. `vercel.json` includes the SPA rewrite so client-side routes
 (`/gallery`, `/view/:id`, ...) resolve on refresh.
 
+Vercel enables its feedback toolbar on preview deployments by default. The
+privacy CSP intentionally blocks that third-party script. To remove the
+`vercel.live` console warning without allowing extra script origins, set
+**Project Settings → General → Vercel Toolbar → Preview/Production: Off**, or
+set `VERCEL_PREVIEW_FEEDBACK_ENABLED=0` for the preview branch.
+
 ## Security notes
 
 - The passphrase is never stored or transmitted. Losing it means **total,
@@ -129,6 +147,9 @@ changing it therefore requires a rebuild. `vercel.json` includes the SPA rewrite
   on lock and before each fresh document renders. Persistent preview JPEGs are
   an explicit trusted-device tradeoff; full-resolution OPFS files are ciphertext.
 - AES-256-GCM authenticates every file; any tampered blob fails to decrypt.
+- The service worker receives the non-extractable key only through structured
+  clone for an active video viewer. It keeps the key and at most three decrypted
+  chunks in RAM, then clears both on viewer cleanup or vault lock.
 - A public Worker URL hides the HF token but is not user authentication. It can
   still be targeted for write/availability abuse, so apply deployment-level
   access controls when your hosting model allows it.
@@ -145,7 +166,8 @@ padding remain out of scope.
 - `npm run dev` — Vite dev server
 - `npm run build` — production build to `dist/`
 - `npm run lint` — ESLint
-- `npm test` — schema, crypto, and backward-compatibility tests
+- `npm test` — schema, crypto, Worker transaction, streaming-upload, abort, and
+  backward-compatibility tests
 - `npm run preview` — preview the production build locally
 
 The repeatable real-browser worker check lives at

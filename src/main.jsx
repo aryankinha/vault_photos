@@ -7,7 +7,7 @@ import { clearCache } from './session/cache'
 // Register the service worker for Background Sync (upload queue recovery).
 // Only on supported browsers — silently skipped elsewhere.
 if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('/sw.js').catch((err) => {
+  navigator.serviceWorker.register('/sw.js', { updateViaCache: 'none' }).catch((err) => {
     // Non-fatal — SW is an enhancement, not required.
     if (import.meta.env.DEV) console.warn('Service worker registration failed:', err)
   })

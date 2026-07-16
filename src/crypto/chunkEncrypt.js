@@ -10,7 +10,9 @@ import {
   isCryptoPoolSupported,
 } from '../workers/cryptoWorkerPool.js'
 
-export const CHUNK_SIZE = 32 * 1024 * 1024
+// New uploads use smaller chunks for fast seek/startup while each manifest
+// keeps its own chunk_size, so existing 32 MiB V3 videos remain compatible.
+export const CHUNK_SIZE = 8 * 1024 * 1024
 
 const INDEX_BYTES = 4
 const NONCE_BYTES = 12
@@ -104,6 +106,15 @@ export async function* encryptFileChunks(file, key, chunkSize = CHUNK_SIZE, onPr
       isLast: index === chunkCount - 1,
     }
   }
+}
+
+export async function encryptFileChunk(file, key, index, chunkSize = CHUNK_SIZE) {
+  const start = index * chunkSize
+  const end = Math.min(start + chunkSize, file.size)
+  const plaintext = await file.slice(start, end).arrayBuffer()
+  const size = plaintext.byteLength
+  const encrypted = await encryptChunkOffThread(plaintext, key, index)
+  return { index, encrypted, size }
 }
 
 export async function* decryptFileChunks(id, chunkCount, key, fetchChunk, onProgress) {

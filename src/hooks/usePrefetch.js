@@ -9,7 +9,7 @@ const MAX_PREFETCHED_ITEMS = 8
 export function prefetch(entry) {
   if (!entry?.id) return Promise.reject(new Error('A media entry is required'))
   // A hover must never start assembling a multi-gigabyte video. Chunked videos
-  // use the progressive MediaSource path when the Viewer opens.
+  // use the authenticated HTTP Range path when the Viewer opens.
   if (entry.type === 'video' && entry.chunked) return Promise.resolve(null)
   const existing = prefetchCache.get(entry.id)
   if (existing) return existing

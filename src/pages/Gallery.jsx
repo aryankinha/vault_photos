@@ -1,6 +1,6 @@
 import { useState, useMemo, useEffect, useRef, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { ImageOff, Loader2, RefreshCw, LayoutGrid, Image as ImageIcon, Film, Upload } from 'lucide-react'
+import { ImageOff, Loader2, RefreshCw, LayoutGrid, Image as ImageIcon, Film, Upload, Trash2 } from 'lucide-react'
 import { Topbar } from '../components/Topbar'
 import { PhotoGrid } from '../components/PhotoGrid'
 import { useGallery } from '../hooks/useGallery'
@@ -22,12 +22,10 @@ export function Gallery() {
     optimisticStates,
     retryOptimistic,
     resumePendingUploads,
+    pendingUploadCount,
+    discardPendingUploads,
   } = useUploadContext()
   const [filter, setFilter] = useState('all')
-
-  useEffect(() => {
-    Promise.resolve().then(() => resumePendingUploads())
-  }, [resumePendingUploads])
 
   // Auto-reload when background upload finishes
   const wasUploadingRef = useRef(false)
@@ -157,6 +155,35 @@ export function Gallery() {
             <Film size={13} />
             Videos
           </button>
+        </div>
+      )}
+
+      {pendingUploadCount > 0 && !isUploading && (
+        <div className="border-b border-amber-500/15 bg-amber-500/5 px-4 py-3">
+          <div className="mx-auto flex max-w-6xl flex-wrap items-center gap-3">
+            <div className="min-w-0 flex-1">
+              <p className="text-xs font-semibold text-amber-200">
+                {pendingUploadCount} interrupted {pendingUploadCount === 1 ? 'upload' : 'uploads'}
+              </p>
+              <p className="mt-0.5 text-[10px] text-amber-200/60">
+                Recovery is paused so files do not restart without your approval.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => void resumePendingUploads()}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-amber-300 px-3 py-1.5 text-[11px] font-semibold text-neutral-950 hover:bg-amber-200"
+            >
+              <RefreshCw size={12} /> Resume
+            </button>
+            <button
+              type="button"
+              onClick={() => void discardPendingUploads()}
+              className="inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[11px] font-semibold text-amber-100 ring-1 ring-amber-300/20 hover:bg-amber-300/10"
+            >
+              <Trash2 size={12} /> Discard
+            </button>
+          </div>
         </div>
       )}
 

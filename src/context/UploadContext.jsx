@@ -15,10 +15,16 @@
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { resumeQueuedUploads, uploadMediaBatch } from '../services/uploadService'
-import { dequeueUpload, setWorkerUrl } from '../session/cache'
+import {
+  clearUploadQueue,
+  getQueuedUpload,
+  getUploadQueue,
+  setWorkerUrl,
+} from '../session/cache'
 import { requestWakeLock, releaseWakeLock } from '../utils/wakeLock'
 import { UploadContext } from './uploadContextValue'
 import { cryptoPool } from '../workers/cryptoWorkerPool'
+import { isAbortError } from '../utils/abort'
 
 /**
  * @typedef {Object} BatchProgress
@@ -45,19 +51,36 @@ export function UploadProvider({ children }) {
   const [optimisticEntries, setOptimisticEntries] = useState(/** @type {object[]} */ ([]))
   const [optimisticThumbs, setOptimisticThumbs] = useState(() => new Map())
   const [optimisticStates, setOptimisticStates] = useState(() => new Map())
+  const [pendingUploadCount, setPendingUploadCount] = useState(0)
   const sourceFilesRef = useRef(new Map())
   const retryQueueRef = useRef([])
-  const resumeAttemptedRef = useRef(false)
   const progressTimerRef = useRef(null)
   const optimisticRemovalTimersRef = useRef(new Map())
   const uploadGenerationRef = useRef(0)
+  const uploadRunningRef = useRef(false)
+  const activeControllerRef = useRef(null)
+  const activeUploadIdsRef = useRef(new Set())
+  const queueCleanupRef = useRef(Promise.resolve())
+
+  const refreshPendingCount = useCallback(async () => {
+    const rows = await getUploadQueue().catch(() => [])
+    setPendingUploadCount(rows.length)
+    return rows.length
+  }, [])
+
+  useEffect(() => {
+    Promise.resolve().then(() => refreshPendingCount())
+  }, [refreshPendingCount])
 
   /**
    * Called as soon as a file finishes local encryption — before any network upload.
    * The photo appears in the gallery immediately.
    */
   const addOptimisticEntry = useCallback((entry, thumbBlob, sourceFile) => {
-    setOptimisticEntries((prev) => [...prev, entry])
+    if (uploadRunningRef.current) activeUploadIdsRef.current.add(entry.id)
+    setOptimisticEntries((prev) => (
+      prev.some((item) => item.id === entry.id) ? prev : [...prev, entry]
+    ))
     setOptimisticThumbs((prev) => new Map(prev).set(entry.id, thumbBlob))
     setOptimisticStates((prev) => new Map(prev).set(entry.id, { status: 'encrypting', progress: 0, error: null }))
     if (sourceFile) sourceFilesRef.current.set(entry.id, sourceFile)
@@ -102,8 +125,6 @@ export function UploadProvider({ children }) {
     setOptimisticStates((prev) => new Map(prev).set(id, { status: 'error', progress: 0, error: errorMsg }))
   }, [])
 
-  // cancel flag — checked between file uploads
-  const cancelRef = useRef(false)
   // current wake lock handle
   const wakeLockRef = useRef(null)
 
@@ -135,16 +156,20 @@ export function UploadProvider({ children }) {
    * @param {File[]} files
    */
   const startBatch = useCallback(async (files) => {
-    if (isUploading) {
+    if (uploadRunningRef.current) {
       retryQueueRef.current.push(...files)
       return
     }
+    uploadRunningRef.current = true
     clearTimeout(progressTimerRef.current)
     const generation = uploadGenerationRef.current
-    cancelRef.current = false
+    const controller = new AbortController()
+    activeControllerRef.current = controller
     setIsUploading(true)
     setBatchProgress(null)
 
+    await queueCleanupRef.current.catch(() => {})
+    if (generation !== uploadGenerationRef.current) return
     await storeWorkerUrl()
     const wakeLock = await requestWakeLock()
     wakeLockRef.current = wakeLock
@@ -166,8 +191,9 @@ export function UploadProvider({ children }) {
         markOptimisticError: (...args) => {
           if (generation === uploadGenerationRef.current) markOptimisticError(...args)
         },
-      })
+      }, { signal: controller.signal })
     } catch (error) {
+      if (isAbortError(error)) return
       if (generation === uploadGenerationRef.current) setBatchProgress({
         totalFiles: files.length,
         completedFiles: files.length,
@@ -190,17 +216,23 @@ export function UploadProvider({ children }) {
         wakeLockRef.current = null
       }
       if (generation === uploadGenerationRef.current) {
+        uploadRunningRef.current = false
+        activeUploadIdsRef.current.clear()
+        if (activeControllerRef.current === controller) activeControllerRef.current = null
         setIsUploading(false)
         // Keep batchProgress visible briefly so the user sees 100% / errors.
         progressTimerRef.current = setTimeout(() => setBatchProgress(null), 3000)
+        void refreshPendingCount()
       }
     }
-  }, [isUploading, addOptimisticEntry, updateOptimisticState, removeOptimisticEntry, markOptimisticError])
+  }, [addOptimisticEntry, updateOptimisticState, removeOptimisticEntry, markOptimisticError, refreshPendingCount])
 
-  const resumePendingUploads = useCallback(async () => {
-    if (resumeAttemptedRef.current || isUploading) return
-    resumeAttemptedRef.current = true
+  const resumePendingUploads = useCallback(async (ids = null) => {
+    if (uploadRunningRef.current) return
+    uploadRunningRef.current = true
     const generation = uploadGenerationRef.current
+    const controller = new AbortController()
+    activeControllerRef.current = controller
     setIsUploading(true)
     const wakeLock = await requestWakeLock()
     wakeLockRef.current = wakeLock
@@ -220,7 +252,7 @@ export function UploadProvider({ children }) {
         markOptimisticError: (...args) => {
           if (generation === uploadGenerationRef.current) markOptimisticError(...args)
         },
-      })
+      }, { signal: controller.signal, ids })
       if (generation === uploadGenerationRef.current && result.errors.length > 0) {
         setBatchProgress({
           totalFiles: result.entries.length + result.errors.length,
@@ -234,8 +266,7 @@ export function UploadProvider({ children }) {
       }
     } catch (error) {
       if (generation !== uploadGenerationRef.current) return
-      // Do NOT reset resumeAttemptedRef here — if commitBatch returns 502 we
-      // must not restart the whole loop. The user must explicitly retry.
+      if (isAbortError(error)) return
       setBatchProgress({
         totalFiles: 1,
         completedFiles: 1,
@@ -258,39 +289,41 @@ export function UploadProvider({ children }) {
         wakeLockRef.current = null
       }
       if (generation === uploadGenerationRef.current) {
+        uploadRunningRef.current = false
+        activeUploadIdsRef.current.clear()
+        if (activeControllerRef.current === controller) activeControllerRef.current = null
         setIsUploading(false)
         clearTimeout(progressTimerRef.current)
         progressTimerRef.current = setTimeout(() => setBatchProgress(null), 3000)
+        void refreshPendingCount()
       }
     }
-  }, [isUploading, addOptimisticEntry, updateOptimisticState, removeOptimisticEntry, markOptimisticError])
+  }, [addOptimisticEntry, updateOptimisticState, removeOptimisticEntry, markOptimisticError, refreshPendingCount])
 
   const retryOptimistic = useCallback((id) => {
-    const sourceFile = sourceFilesRef.current.get(id)
+    void (async () => {
+      clearTimeout(optimisticRemovalTimersRef.current.get(id))
+      optimisticRemovalTimersRef.current.delete(id)
 
-    clearTimeout(optimisticRemovalTimersRef.current.get(id))
-    optimisticRemovalTimersRef.current.delete(id)
-    setOptimisticEntries((prev) => prev.filter((entry) => entry.id !== id))
-    setOptimisticThumbs((prev) => { const next = new Map(prev); next.delete(id); return next })
-    setOptimisticStates((prev) => { const next = new Map(prev); next.delete(id); return next })
-    sourceFilesRef.current.delete(id)
+      // Small uploads retain their encrypted queue row and media id. Retrying
+      // that same transaction is idempotent even if HF committed before a 502.
+      if (await getQueuedUpload(id).catch(() => null)) {
+        updateOptimisticState(id, { status: 'uploading', progress: 0, error: null })
+        await resumePendingUploads([id])
+        return
+      }
 
-    if (!sourceFile) {
-      resumeAttemptedRef.current = false
-      if (!isUploading) void resumePendingUploads()
-      return
-    }
+      const sourceFile = sourceFilesRef.current.get(id)
+      setOptimisticEntries((prev) => prev.filter((entry) => entry.id !== id))
+      setOptimisticThumbs((prev) => { const next = new Map(prev); next.delete(id); return next })
+      setOptimisticStates((prev) => { const next = new Map(prev); next.delete(id); return next })
+      sourceFilesRef.current.delete(id)
 
-    // Retrying creates a fresh media id. Remove the failed encrypted queue row
-    // first so recovery cannot later publish both attempts as separate files.
-    void dequeueUpload(id).catch(() => {})
-
-    if (isUploading) {
-      retryQueueRef.current.push(sourceFile)
-      return
-    }
-    void startBatch([sourceFile])
-  }, [isUploading, resumePendingUploads, startBatch])
+      if (!sourceFile) return
+      if (uploadRunningRef.current) retryQueueRef.current.push(sourceFile)
+      else await startBatch([sourceFile])
+    })()
+  }, [resumePendingUploads, startBatch, updateOptimisticState])
 
   useEffect(() => {
     if (isUploading || retryQueueRef.current.length === 0) return
@@ -299,16 +332,59 @@ export function UploadProvider({ children }) {
   }, [isUploading, startBatch])
 
   const cancelBatch = useCallback(() => {
-    cancelRef.current = true
+    const activeIds = [...activeUploadIdsRef.current]
+    activeControllerRef.current?.abort()
+    activeControllerRef.current = null
+    uploadRunningRef.current = false
+    activeUploadIdsRef.current.clear()
     uploadGenerationRef.current += 1
     cryptoPool.terminate()
+    retryQueueRef.current = []
+    queueCleanupRef.current = activeIds.length > 0
+      ? clearUploadQueue(activeIds).catch(() => {})
+      : Promise.resolve()
+    void queueCleanupRef.current.then(() => refreshPendingCount())
+    void releaseWakeLock(wakeLockRef.current)
+    wakeLockRef.current = null
     setIsUploading(false)
+    setOptimisticEntries([])
+    setOptimisticThumbs(new Map())
+    setOptimisticStates(new Map())
+    sourceFilesRef.current.clear()
+    clearTimeout(progressTimerRef.current)
+    setBatchProgress((previous) => previous ? {
+      ...previous,
+      currentFile: '',
+      stage: 'cancelled',
+      etaDisplay: '',
+    } : null)
+    progressTimerRef.current = setTimeout(() => setBatchProgress(null), 2500)
+  }, [refreshPendingCount])
+
+  const dismissBatchProgress = useCallback(() => {
+    clearTimeout(progressTimerRef.current)
+    setBatchProgress(null)
+  }, [])
+
+  const discardPendingUploads = useCallback(async () => {
+    await clearUploadQueue().catch(() => {})
+    setPendingUploadCount(0)
+    setOptimisticEntries([])
+    setOptimisticThumbs(new Map())
+    setOptimisticStates(new Map())
+    sourceFilesRef.current.clear()
+    setBatchProgress(null)
   }, [])
 
   const lockUploadSession = useCallback(() => {
-    cancelRef.current = true
+    activeControllerRef.current?.abort()
+    activeControllerRef.current = null
+    uploadRunningRef.current = false
+    activeUploadIdsRef.current.clear()
     uploadGenerationRef.current += 1
     cryptoPool.terminate()
+    queueCleanupRef.current = clearUploadQueue().catch(() => {})
+    setPendingUploadCount(0)
     void releaseWakeLock(wakeLockRef.current)
     wakeLockRef.current = null
     setIsUploading(false)
@@ -318,7 +394,6 @@ export function UploadProvider({ children }) {
     setOptimisticStates(new Map())
     sourceFilesRef.current.clear()
     retryQueueRef.current = []
-    resumeAttemptedRef.current = false
     clearTimeout(progressTimerRef.current)
     for (const timer of optimisticRemovalTimersRef.current.values()) clearTimeout(timer)
     optimisticRemovalTimersRef.current.clear()
@@ -339,6 +414,7 @@ export function UploadProvider({ children }) {
       batchProgress,
       startBatch,
       cancelBatch,
+      dismissBatchProgress,
       // V3 optimistic state
       optimisticEntries,
       optimisticThumbs,
@@ -349,6 +425,8 @@ export function UploadProvider({ children }) {
       markOptimisticError,
       retryOptimistic,
       resumePendingUploads,
+      pendingUploadCount,
+      discardPendingUploads,
       lockUploadSession,
     }}>
       {children}

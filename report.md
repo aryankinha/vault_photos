@@ -88,12 +88,12 @@ Everything else is derived or encrypted.
   automatic uncompressed V1/V2 fallback.
 - **IndexedDB + OPFS** — persistent low-resolution thumbnails, encrypted full
   file cache, upload recovery, and decrypted session metadata.
-- **MediaSource** — progressive playback when uploaded video bytes are valid
-  MSE segments, with full-Blob fallback otherwise.
+- **Service Worker + HTTP Range** — format-agnostic chunked playback and native
+  seeking without assembling a full video Blob in window memory.
 - **IntersectionObserver** — progressive bundle loading and bounded thumbnail
   object-URL lifetimes.
 - **Screen Wake Lock + Background Sync** — long-upload resilience where the
-  browser supports these optional APIs.
+  browser supports these optional APIs; background recovery is strictly bounded.
 - **`fetch`** — all network calls.
 
 ### Build/lint
@@ -165,7 +165,7 @@ vaultphotos/
 │   ├── manifest.json              PWA manifest
 │   ├── favicon.svg                app icon (also used by PWA)
 │   ├── icons.svg
-│   └── sw.js                      encrypted upload recovery via Background Sync
+│   └── sw.js                      bounded recovery + authenticated video ranges
 ├── src/
 │   ├── main.jsx                   session cleanup, SW registration, React root
 │   ├── App.jsx                    router + <RequireUnlock> guard + UploadProvider
@@ -184,7 +184,7 @@ vaultphotos/
 │   │   ├── keyDerivation.js       argon2id → non-extractable RAM-only CryptoKey
 │   │   ├── encrypt.js             AES-GCM packed format + pool facade
 │   │   ├── decrypt.js             authenticated decrypt + pool facade
-│   │   └── chunkEncrypt.js        32 MiB indexed-AAD async generators
+│   │   └── chunkEncrypt.js        indexed-AAD chunks (new: 8 MiB; legacy compatible)
 │   │
 │   ├── workers/
 │   │   ├── cryptoWorker.js        crypto, EXIF, OffscreenCanvas task runtime
@@ -197,6 +197,8 @@ vaultphotos/
 │   │   ├── dateGroup.js           group entries by month for the gallery
 │   │   ├── eta.js                 rolling-window ETA Tracker
 │   │   ├── errors.js              production-safe user error messages
+│   │   ├── abort.js               AbortSignal helpers for upload cancellation
+│   │   ├── hash.js                browser SHA-256 for streamed LFS uploads
 │   │   └── wakeLock.js            Screen Wake Lock helper
 │   │
 │   ├── storage/
@@ -210,7 +212,7 @@ vaultphotos/
 │   │   ├── galleryService.js      cached first paint + page hydration
 │   │   ├── uploadService.js       bounded upload + atomic commit + recovery
 │   │   ├── viewerService.js       encrypted OPFS read-through + Blob URL
-│   │   └── videoStreamService.js  MSE stream with full-assembly fallback
+│   │   └── videoStreamService.js  service-worker HTTP Range stream lifecycle
 │   │
 │   ├── session/
 │   │   └── cache.js               IDB session/thumb/uploadQueue stores
@@ -219,7 +221,7 @@ vaultphotos/
 │   │   ├── useGallery.js          progressive pages + merge state
 │   │   ├── usePrefetch.js         bounded hover/long-press promise cache
 │   │   ├── useUpload.js           { upload, status, error, reset, STATUS } (legacy)
-│   │   └── useViewer.js           prefetch/MSE/full-load orchestration
+│   │   └── useViewer.js           prefetch/range-stream/full-load orchestration
 │   │
 │   ├── pages/
 │   │   ├── Unlock.jsx             passphrase; auto-detects first-run → Create mode
@@ -232,17 +234,20 @@ vaultphotos/
 │       ├── PhotoGrid.jsx          shared observer bounds object URL lifetimes
 │       ├── PhotoCard.jsx          media tile + optimistic status/retry overlay
 │       ├── DateGroup.jsx          month header section
-│       ├── PersistentUploadBar.jsx fixed bottom progress bar (ETA + count)
+│       ├── PersistentUploadBar.jsx fixed progress bar (ETA + cancel/discard)
 │       └── UploadProgress.jsx     legacy upload list component
 │
 ├── tests/
-│   ├── core.test.js               schema/crypto/legacy compatibility suite
+│   ├── core.test.js               schema/crypto/abort/legacy compatibility suite
+│   ├── serviceWorker.test.js      Range parser + authenticated chunk tests
+│   ├── worker.test.js             commit split/retry + streamed LFS route tests
 │   └── browser/                   50 MiB worker responsiveness harness
 ├── worker/
-│   └── index.js                   17 route patterns, LFS, atomic commits
+│   ├── commitPlan.js              ≤40-operation metadata-last commit planner
+│   └── index.js                   17 route patterns, streamed LFS, bounded commits
 │
 ├── wrangler.toml                  CF Worker config (HF_TOKEN/HF_REPO as secrets)
-├── vercel.json                    SPA rewrite + asset caching
+├── vercel.json                    SPA rewrite, asset caching, SW revalidation
 ├── .env.example                   VITE_WORKER_URL only
 ├── vite.config.js
 ├── eslint.config.js
@@ -297,7 +302,7 @@ MediaEntry {
   thumb_length : number,             // byte length of this thumb in thumbs.bundle
   page_index?  : number,              // V3 page; absent = legacy/page 0
   chunked?     : boolean,             // V3 large-file storage
-  chunk_size?  : number,              // plaintext bytes per chunk (32 MiB)
+  chunk_size?  : number,              // plaintext bytes per chunk (new: 8 MiB; legacy value retained)
   chunk_count? : number,              // number of encrypted chunk objects
 }
 ```
@@ -395,7 +400,7 @@ return crypto.subtle.decrypt({ name:'AES-GCM', iv:nonce, tagLength:128 }, key, c
 //                              ↑ throws OperationError if the tag doesn't verify
 ```
 
-Large packed files and all 32 MiB chunks are dispatched through
+Large packed files and all encrypted chunks are dispatched through
 `cryptoWorkerPool.js`. The pool is FIFO, uses at most four Vite module workers,
 transfers buffers without copying, and is terminated on lock. Manifest and
 bundle crypto stays on the main path because those objects are small.
@@ -416,10 +421,11 @@ Videos use `<video>.duration`; missing dates fall back to upload time.
 
 ### 7.5 `storage/workerClient.js`
 
-The **only** module that calls `fetch`. All binary is
-`application/octet-stream` (raw), not base64 — this avoids 33% inflation and
-keeps large video uploads under the CF Worker body cap. Each function returns
-`ArrayBuffer` (GET) or accepts `ArrayBuffer|Uint8Array` (POST).
+The **only app module that calls the storage Worker**. Binary uploads are raw
+`application/octet-stream`; XHR carries an exact ciphertext size and browser-
+computed SHA-256 so the Worker can use `FixedLengthStream` to forward the body
+to LFS without allocating another full copy. Every upload and finalization call
+accepts an `AbortSignal`.
 
 ```js
 const WORKER_URL = import.meta.env.VITE_WORKER_URL
@@ -430,12 +436,12 @@ export const uploadManifest = (b) => xhrPost('/upload-manifest', b)
 export const getBundle      = () => getBytes('/get-bundle')
 export const uploadBundle   = (b) => xhrPost('/upload-bundle', b)
 export const getFile        = (id) => getBytes(`/get-file/${id}`)
-export const uploadFile     = (id, b, onProgress, commit = true) => xhrPost(`/upload-file?id=${encodeURIComponent(id)}${commit ? '' : '&commit=false'}`, b, onProgress)
+export const uploadFile     = (id, b, onProgress, commit, options) => xhrPost(`/upload-file?id=${encodeURIComponent(id)}&commit=${commit}`, b, onProgress, options)
 export const getBundlePage  = (i) => getBytes(`/get-bundle-page/${i}`)
 export const getChunk       = (id, i) => getBytes(`/get-chunk/${id}/${i}`)
 export const preauthUpload  = (id, size, sha256) => postJson('/preauth-upload', { id, size, sha256 })
 export const commitUpload   = (id, sha256, size, verifyUrl, verifyHeaders) => postJson('/commit-upload', { id, sha256, size, verifyUrl, verifyHeaders })
-export const commitBatch    = (payload) => postJson('/commit-batch', payload)
+export const commitBatch    = (payload, options) => postJson('/commit-batch', payload, options)
 export const listIds        = () => fetch(`${WORKER_URL}/list`).then(r => r.json())
 ```
 
@@ -447,14 +453,15 @@ without migration. First-run initialization is an atomic Worker operation,
 not a sequence of independent empty-file uploads.
 
 `bundle.js` retains every legacy export and adds page load/save/append helpers.
-Upload finalization rewrites only the active page, then publishes it alongside
-the manifest and LFS pointers in one commit.
+Upload finalization rewrites only the active page. Large pointer sets may be
+committed first in bounded groups; the page and manifest are published together
+only in the final commit.
 
 ### 7.7 `session/cache.js`
 
 IndexedDB via `idb`, featuring three stores:
 1. `kv` — short-lived decrypted manifest metadata and the Worker URL used by the Service Worker.
-2. `uploadQueue` — already-encrypted small-file bytes plus metadata. Background Sync uploads only the LFS object; final manifest/bundle publication waits for the unlocked app and remains atomic/idempotent.
+2. `uploadQueue` — already-encrypted small-file bytes or completed chunk receipts plus metadata. Background Sync handles at most three objects per event and two attempts per object; foreground finalization waits for explicit Resume and remains idempotent. Cancel/Discard removes rows and aborts in-flight service-worker requests.
 3. `thumbCache` — persistent decrypted JPEG previews. This is an explicit personal-device UX tradeoff and can be cleared separately.
 
 OPFS stores persistent full files only as their original encrypted HF bytes in
@@ -465,23 +472,23 @@ decrypted session bundle cache is separate and is cleared on lock/startup.
 
 - **`galleryService`** — emits cached thumbnails immediately, hydrates only
   missing page 0 thumbnails, then exposes demand loading for later pages.
-- **`uploadService`** — prepares files independently, uses bounded upload
-  concurrency, stores LFS objects with `commit=false`, and publishes successful
-  files/chunks + bundle pages + manifest in one `/commit-batch` transaction.
-  Files at least 50 MiB are read and encrypted 32 MiB at a time.
+- **`uploadService`** — pipelines local preparation and bounded network work,
+  stores LFS objects with `commit=false`, and publishes successful files/chunks
+  plus bundle metadata through `/commit-batch`. All new videos and files at
+  least 50 MiB use 8 MiB chunks; two chunks per video may transfer concurrently.
 - **`viewerService`** — reads encrypted non-chunked files from OPFS when
   available, otherwise fetches from the Worker and writes ciphertext through to
-  OPFS. Chunked media is authenticated in order; videos first attempt MSE.
-- **`videoStreamService`** — appends decrypted chunks to a `SourceBuffer` only
-  when the MIME is reported as supported; any append/decode failure triggers the
-  complete Blob fallback.
+  OPFS. Legacy non-chunked videos retain the complete-Blob compatibility path.
+- **`videoStreamService`** — registers an active video, non-extractable key, and
+  Worker origin with the service worker. The returned same-origin URL supports
+  native byte ranges and seek without complete assembly.
 
 ### 7.9 `hooks/`
 
 `useGallery` owns progressive page state and de-duplicates in-flight page loads.
 `usePrefetch` coalesces hover/150 ms long-press intent in a bounded eight-item
 Promise cache (chunked video is intentionally excluded). `useViewer` consumes
-that Promise, handles MSE fallback, and revokes every owned object URL.
+that Promise, owns Range-stream registration, and clears every stream/object URL.
 
 ### 7.10 `App.jsx` — routing & guard
 
@@ -521,12 +528,12 @@ matches 17 route patterns, is stateless, CORS-open (`*`), and handles OPTIONS.
 | `/get-bundle-page/:pageIndex` | GET | → raw bytes | resolve cache-busted `thumbs_page_N.bundle` |
 | `/upload-bundle-page/:pageIndex` | POST | raw bytes | compatibility page update route |
 | `/get-file/:id` | GET | → raw bytes | resolve `files/<id>.enc` |
-| `/upload-file?id=...` | POST | raw bytes | **LFS-aware** upload (takes optional `&commit=false` to defer git commits) |
+| `/upload-file?id=...` | POST | raw bytes | **LFS-aware streamed upload**; SHA-256/size headers avoid Worker buffering and `commit=false` defers pointers |
 | `/get-chunk/:id/:index` | GET | → raw bytes | resolve `files/<id>_chunk_N.enc` |
-| `/upload-chunk?id=...&index=...` | POST | raw bytes | upload an encrypted LFS chunk; supports `commit=false` |
+| `/upload-chunk?id=...&index=...` | POST | raw bytes | stream an encrypted LFS chunk; supports `commit=false` and cancellation |
 | `/preauth-upload` | POST | → JSON | Direct-to-S3 step 1: negotiate LFS credentials (preupload + LFS batch) using metadata, return S3 upload URL & headers (or check if alreadyExists) |
 | `/commit-upload` | POST | → JSON | Direct-to-S3 step 2: finalize LFS upload (optional LFS verify + commit LFS pointer) |
-| `/commit-batch` | POST | → JSON | one Git commit for file/chunk LFS pointers, changed bundle/page data, and manifest |
+| `/commit-batch` | POST | → JSON | cap commits at ≤40 total operations; stage pointers/pages first, publish manifest last, retry transient failures |
 | `/list` | GET | → JSON `[id,...]` | list `files/` tree, strip prefix/suffix (cache-busted) |
 
 ### Direct-to-S3 Handshake (`preauthUpload` & `commitUpload`)
@@ -692,23 +699,24 @@ PhotoGrid shared IntersectionObserver
 
 ### 10.4 Upload a photo or video
 
-The batch pipeline prepares each file independently, continues after per-file
-failures, and uses at most three concurrent network uploads:
+The batch pipeline overlaps preparation and transfer, continues after per-file
+failures, and uses bounded concurrency:
 
 ```
 read 64 KiB EXIF → thumbnail → cache thumbnail
         │
-        ├── < 50 MiB: worker-pool encrypt whole file
+        ├── non-video < 50 MiB: worker-pool encrypt whole file
         │              └── queue encrypted bytes for recovery
         │
-        └── ≥ 50 MiB: read/encrypt one 32 MiB indexed chunk at a time
+        └── every video or file ≥ 50 MiB: 8 MiB indexed chunks
+                    └── encrypt/upload pipeline with two in flight per file
         │
         ▼
 add optimistic gallery card before network confirmation
         │
         ▼
-POST encrypted file/chunks to Worker with commit=false
-        └── Worker uploads LFS object and returns {sha256,size}
+POST encrypted file/chunks to Worker with SHA-256/size + commit=false
+        └── Worker FixedLengthStream → LFS, returns {sha256,size}
         │
         ▼
 load latest manifest + active legacy/page bundle
@@ -716,7 +724,8 @@ append successful entries → gzip/encrypt manifest + encrypt changed page
         │
         ▼
 POST /commit-batch
-        └── one HF Git commit: LFS pointers + bundle/page + manifest
+        ├── groups of ≤40 pointer/page operations when required
+        └── final commit: remaining operations + manifest publication
         │
         ▼
 dequeue recovery rows → invalidate decrypted session cache → gallery reload
@@ -741,7 +750,9 @@ Blob → object URL → image/video
 ```
 Topbar "Lock" click
   ├── upload generation++     // late async callbacks become inert
+  ├── AbortController.abort() // XHR, fetch, and offline waits stop
   ├── cryptoPool.terminate()
+  ├── clear recovery rows + service-worker stream sessions
   ├── release wake lock + clear optimistic/prefetch URLs
   ├── clearActiveKey()
   ├── clearCache()            // decrypted metadata/bundle only
@@ -754,12 +765,12 @@ to `/unlock`, because `hasActiveKey()` is false.
 ### 10.7 Chunked upload
 
 ```
-File ≥ 50 MiB
+New video or file ≥ 50 MiB
    │
-   ├── slice 0..32 MiB → transfer to crypto worker
+   ├── slice 0..8 MiB → transfer to crypto worker
    │      └── [index=0][nonce][ciphertext+tag] → upload LFS object, no commit
-   ├── slice 32..64 MiB → transfer → index=1 → upload, no commit
-   └── ... one plaintext chunk resident at a time
+   ├── slice 8..16 MiB → transfer → index=1 → upload, no commit
+   └── ... at most two upload chunks in the per-file pipeline
           │
           ▼
 collect {id,index,sha256,size} receipts
@@ -769,19 +780,18 @@ collect {id,index,sha256,size} receipts
 ### 10.8 Chunked video streaming
 
 ```
-Viewer → MediaSource.isTypeSupported(mime)?
-   ├── no  → fetch/decrypt all chunks → Blob URL
-   └── yes → create SourceBuffer
-              ├── GET chunk 0 → worker decrypt/AAD verify → append → canplay
-              ├── GET chunk 1 → worker decrypt/AAD verify → append
-              └── ... → endOfStream
-
-Any SourceBuffer/segment failure → cleanup MSE URL → full Blob fallback
+Viewer registers {entry, non-extractable key, Worker URL} in service-worker RAM
+        │
+        ▼
+<video src="/__vault_stream__/session"> makes native Range requests
+        ├── bytes near start → fetch/decrypt only required chunk(s)
+        ├── seek near end    → fetch/decrypt only target chunk(s)
+        └── return 206 + Content-Range + exact Content-Length
 ```
 
-MSE requires valid browser media segments; arbitrary file slices are not always
-appendable. The fallback is therefore a correctness path, not merely a legacy
-browser path.
+The service worker keeps at most three decrypted chunks in an LRU RAM cache,
+zeros evicted buffers, and clears the non-extractable key on viewer cleanup or
+lock. Legacy non-chunked videos keep their complete-Blob compatibility path.
 
 ### 10.9 Optimistic UI
 
@@ -812,19 +822,19 @@ layers were complete.
 | V3-4 | Persistent IndexedDB thumbnail cache | Complete |
 | V3-5 | 50-entry progressive bundle pages | Complete |
 | V3-6 | Optimistic cards, progress, per-file retry | Complete |
-| V3-7 | 32 MiB indexed-AAD large-file chunks | Complete; format + legacy tests |
+| V3-7 | Indexed-AAD large-file chunks | Complete; new 8 MiB chunks + legacy 32 MiB compatibility |
 | V3-8 | Hover / 150 ms long-press prefetch | Complete |
 | V3-9 | Encrypted OPFS full-file cache | Complete |
-| V3-10 | MSE video streaming with full-assembly fallback | Complete |
+| V3-10 | Service-worker HTTP Range video streaming | Complete; native seek + bounded decrypted RAM |
 | V3-11 | CSP, key/error/nonce audit, atomic initialization | Complete |
 | V3-12 | Lazy URLs, skeletons, recovery states, touch gestures | Complete |
 | V3-13 | Compatibility tests, cleanup, report and final checks | Complete |
 
-Final verification: **5/5 Node tests**, **`npm run lint` → 0 errors / 0
+Final verification: **15/15 Node tests**, **`npm run lint` → 0 errors / 0
 warnings**, **`npm run build` → clean**, and **`node --check
-worker/index.js` → no output**. Production assets: main JS **145.49 kB gzip**,
-CSS **5.89 kB gzip**, crypto worker **77.23 kB** emitted separately. The main
-bundle is only **4.95 kB gzip** above the measured V2 baseline (140.54 kB).
+worker/index.js` → no output**. Production assets: main JS **147.46 kB gzip**,
+CSS **6.18 kB gzip**, crypto worker **77.23 kB** emitted separately. The main
+bundle is only **6.92 kB gzip** above the measured V2 baseline (140.54 kB).
 
 ### Notable issues hit & fixed during build
 
@@ -852,12 +862,12 @@ scheduled, cached, and committed:
 | Area | V3 result |
 |---|---|
 | Responsiveness | Whole-file and chunk crypto use a transferable four-worker pool; a real 50 MiB round trip preserved animation/timer progress. |
-| Large files | Files at least 50 MiB use authenticated 32 MiB chunks, avoiding whole-video reads and detecting reorder/tamper. |
+| Large files | Every new video and files at least 50 MiB use authenticated 8 MiB chunks; existing 32 MiB entries remain readable. |
 | Gallery scale | Gzip manifests, persistent preview cache, 50-entry bundle pages, and viewport-scoped object URLs reduce startup bandwidth and memory. |
-| Upload UX | Optimistic cards appear before network confirmation; files report independent progress/error/retry states. |
-| Reliability | Bounded uploads stage LFS objects without Git commits, then publish pointers + changed page + manifest atomically. Recovery is idempotent. |
+| Upload UX | Optimistic cards appear before network confirmation; files report progress/error, same-ID retry, and an authoritative cancel/discard action. |
+| Reliability | Bounded uploads stage LFS objects, cap HF commits at ≤40 operations, publish the manifest last, and retain small-file or chunk receipts for idempotent recovery. |
 | Repeat viewing | OPFS persists only encrypted non-chunked HF bytes and authenticates/decrypts them with the RAM key on read. |
-| Video | Chunked video attempts MSE playback after the first appendable segment and falls back to complete Blob assembly on unsupported media. |
+| Video | A service-worker virtual URL answers native HTTP Range requests by fetching and authenticating only required chunks; no whole-video window assembly for chunked entries. |
 | Security | Atomic first-run initialization, non-extractable keys, temporary-key zeroing, strict CSP, generic production errors, and lock-time worker cleanup. |
 | UX polish | Gallery/viewer skeletons, explicit recovery actions, empty state, swipe/pinch/double-tap image gestures, and offline waiting state. |
 
@@ -888,6 +898,12 @@ npm run build                 # → dist/
 ```
 
 Import into Vercel, set `VITE_WORKER_URL` as an env var, redeploy. `vercel.json` includes the SPA rewrite so `/view/:id` resolves on direct hit/refresh.
+
+Deploy the Worker before the app for the streamed SHA/size upload headers and
+bounded commit behavior. Vercel's preview feedback toolbar is intentionally not
+allowed by the privacy CSP; disable it in **Project Settings → General → Vercel
+Toolbar** (or set `VERCEL_PREVIEW_FEEDBACK_ENABLED=0`) to remove its blocked-
+script console warning without adding a third-party script origin.
 
 ### Prerequisites
 
@@ -925,13 +941,15 @@ VaultPhotos V3 adds a suite of optimization, security, and UI features to handle
 
 ### 14.6 Real-time Optimistic UI & Robust Failures
 * **UX Enhancements:** Uploading media appears instantly in the gallery with active status cards.
-* **Fine-Grained States:** Shows encrypting, uploading, waiting-for-connection, done, and error states. Each file can fail independently, and retry discards the failed queue row before creating a fresh id.
+* **Fine-Grained States:** Shows encrypting, uploading, waiting-for-connection, done, cancelled, and error states. Cancel aborts XHR/fetch/offline waits, terminates crypto workers, clears queued rows, and prevents late callbacks from restoring state. Interrupted rows appear in a gallery banner with explicit Resume and Discard actions; they never restart automatically after unlock.
+* **Idempotent retry:** A failed finalization retains the same encrypted row or completed chunk receipts. Retry checks the current manifest and reuses the same media id, so an HF commit that succeeded before a timeout cannot create a duplicate image.
 * **Commit handoff:** Successful optimistic entries remain briefly while the gallery reloads; the committed manifest entry wins by id without a visual disappearance.
 
 ### 14.7 Chunked Streaming Encryption for Large Files
-* **Concept:** Files >= 50MB automatically switch to the chunked upload pipeline. Instead of a single massive memory buffer, files are processed in sequential chunks of 32MB.
+* **Concept:** Every new video and files >= 50MB use authenticated 8MB chunks. Existing manifests record their own `chunk_size`, so earlier 32MB V3 uploads remain compatible.
 * **Reordering Attack Prevention:** Every chunk is encrypted individually using AES-GCM. The 4-byte chunk index (Big-Endian) is passed as Additional Authenticated Data (AAD) during the `crypto.subtle.encrypt` operation. If an attacker tampers with or swaps the sequence of chunks in the Hugging Face repository, decryption fails with an `OperationError` since the AAD signature verification fails.
-* **Chunked Assembly:** Worker-backed async generators keep at most one plaintext upload chunk resident. The viewer authenticates chunks in order and either streams appendable video data or assembles a final Blob.
+* **Pipelined upload:** Two chunks per video can be encrypted/hashed/uploaded concurrently. Across a batch, preparation of later files overlaps transfer of earlier files, reducing idle CPU and network time.
+* **Worker memory:** The browser sends ciphertext SHA-256 and size headers. Cloudflare negotiates LFS and forwards a `FixedLengthStream`, avoiding an extra `request.arrayBuffer()` copy inside the 128MB Worker isolate.
 
 ### 14.8 Prefetch on Hover / Long Press (Phase 8)
 
@@ -974,7 +992,7 @@ worker.getFile(id) → decryptPacked() → objectURL (normal cold path)
   keeps ciphertext for fast re-unlock. A corrupt/tampered cache file fails GCM,
   is deleted, and is fetched again from the Worker.
 * **Chunked files excluded** — combining all chunks before writing would recreate
-  the memory spike chunking avoids. Chunked video uses MSE/fallback instead.
+  the memory spike chunking avoids. Chunked video uses HTTP Range streaming.
 * **Legacy cleanup** — an earlier experimental plaintext `media/` directory is
   removed once if it exists.
 * **Feature fallback** — every OPFS operation is guarded; unsupported/quota/error
@@ -985,31 +1003,27 @@ worker.getFile(id) → decryptPacked() → objectURL (normal cold path)
 
 **Key files:** `src/storage/opfsCache.js`, `src/services/viewerService.js`, `src/session/cache.js`.
 
-### 14.10 Chunked Video Streaming via MediaSource Extensions (Phase 10)
+### 14.10 Chunked Video Streaming via HTTP Range (Phase 10)
 
 **Problem:** Even with chunked encryption (Phase 7), the viewer assembled all chunks before creating a single Blob URL. A 2 GB video with 64 chunks still required all 64 chunks before playback started.
 
-**Architecture:** For `entry.chunked && entry.type === 'video'`, the viewer tries
-the browser's **MediaSource Extensions (MSE)** API. Playback can begin after the
-first valid segment is appended; ordinary MP4 byte slices may be rejected and
-therefore always have a full-assembly fallback.
+**Architecture:** For `entry.chunked && entry.type === 'video'`, the viewer
+registers a short-lived session with the service worker and gives `<video>` a
+same-origin virtual URL. Native browser requests such as `Range: bytes=0-...`
+are mapped to the minimum encrypted chunks needed for startup or seeking.
 
-**`src/services/videoStreamService.js`** (new):
-* **Codec probing** — `resolveSourceBufferType()` checks generic and common codec-qualified MP4/WebM strings with `MediaSource.isTypeSupported()`. A positive result is treated as a capability hint, not a guarantee about this file's segmentation.
-* **`createVideoStream(entry, mimeType, callbacks)`** — creates a `MediaSource`, gets its object URL synchronously, then starts an async coroutine in the `sourceopen` event that:
-  1. Calls `mediaSource.addSourceBuffer(sourceBufferType)`
-  2. Iterates `decryptFileChunks()` (the Phase 7 async generator)
-  3. Attaches completion/error listeners before each `appendBuffer()` and serializes updates
-  4. Calls `onProgress(done / total)` after each chunk
-  5. Calls `mediaSource.endOfStream()` when all chunks are appended
-* **`isMseSupported(mimeType)`** — synchronous feature-detection gate before any MSE work begins.
-* **Graceful fallback** — unsupported MIME, synchronous append failure, SourceBuffer error, or invalid media segments all clean up MSE and invoke the full-assembly `loadFullMedia` path.
-* **Cleanup** — `cleanup()` aborts any pending `SourceBuffer` operation, calls `mediaSource.endOfStream()`, and revokes the object URL. Called by `useViewer`'s effect cleanup on unmount or navigation.
+**`src/services/videoStreamService.js` + `public/sw.js`:**
+* **Registration** — structured-clones the non-extractable `CryptoKey`, entry size/chunk metadata, and Worker URL into service-worker RAM. The key is never exported or persisted.
+* **206 responses** — parses single byte ranges, returns exact `Content-Range`, `Content-Length`, `Accept-Ranges`, and the original MIME type.
+* **Backpressure** — a byte `ReadableStream.pull()` fetches the next chunk only when the media element requests more data; cancelling playback stops an open-ended range after the current chunk.
+* **Authenticated sparse reads** — calculates the first/last required chunk, fetches only those ciphertext objects, then validates current `[index][nonce][ciphertext+tag]` or legacy `[nonce][ciphertext+tag]` layouts with index AAD.
+* **Bounded RAM** — an LRU retains at most three decrypted chunks for repeated MP4 metadata/seek requests; eviction zeros the `Uint8Array` before deletion.
+* **Cleanup** — navigation, viewer cleanup, or lock aborts pending chunk fetches, zeros cached plaintext, and drops the service-worker key/session.
+* **Compatibility fallback** — browsers without service-worker control and legacy non-chunked videos retain the full-Blob path.
 
 **Buffering UI in `Viewer.jsx`:**
-* A sky progress bar is positioned at the bottom of the `<video>` element, growing left→right as `streamProgress` advances.
-* A `Loader2 + "Buffering N%"` indicator appears in the header while `streaming && streamProgress < 1`.
-* Both disappear the moment `streamProgress` reaches 1 (all chunks buffered).
+* A sky progress bar and `Buffering N%` label reflect unique chunks authenticated
+  during startup and disappear as soon as the native video reaches `canplay`.
 
 **Key files:** `src/services/videoStreamService.js` (new), `src/hooks/useViewer.js`, `src/pages/Viewer.jsx`.
 
@@ -1024,13 +1038,13 @@ states, and viewport-bounded thumbnail URLs.
 
 | Check | Result |
 |---|---|
-| `npm test` | 5/5: schemas, bundle offsets, AES-GCM tamper rejection, current/legacy chunks, gzip/plain manifests |
+| `npm test` | 15/15: schemas, AES-GCM compatibility/tamper, gzip/plain manifests, abort, bounded background recovery, Range parsing/decrypt/body delivery, commit planning/retry, and streamed Worker upload |
 | Browser worker harness | 50 MiB round trip identical in 684 ms; input/output transfers detached; 77 animation frames and 41 timer ticks during crypto; no browser errors |
 | `npm run lint` | 0 errors, 0 warnings |
-| `npm run build` | clean; main 145.49 kB gzip, CSS 5.89 kB gzip, worker emitted separately at 77.23 kB |
+| `npm run build` | clean; main 147.46 kB gzip, CSS 6.18 kB gzip, worker emitted separately at 77.23 kB |
 | `node --check worker/index.js` | clean, no output |
 
-Main-bundle delta from the measured V2 baseline is **4.95 kB gzip**, below the
+Main-bundle delta from the measured V2 baseline is **6.92 kB gzip**, below the
 60 kB budget. The worker includes `exifr`, so its separate uncompressed chunk is
 larger; it is not counted in the main-bundle budget.
 

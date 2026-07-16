@@ -22,6 +22,12 @@ const { encryptPacked } = await import('../src/crypto/encrypt.js')
 const { decryptPacked } = await import('../src/crypto/decrypt.js')
 const { decryptChunk, encryptChunk } = await import('../src/crypto/chunkEncrypt.js')
 const { encodeManifest, parseManifestBytes } = await import('../src/storage/manifestCodec.js')
+const {
+  MAX_LFS_POINTERS_PER_COMMIT,
+  MAX_HF_OPERATIONS_PER_COMMIT,
+  planCommitBatches,
+} = await import('../worker/commitPlan.js')
+const { abortableDelay } = await import('../src/utils/abort.js')
 
 test('manifest accepts old entries and optional V3 fields', () => {
   const manifest = createEmptyManifest('2026-01-01T00:00:00.000Z')
@@ -123,4 +129,48 @@ test('gzip and old plain manifest encodings both parse', async () => {
 
   const oldBytes = new TextEncoder().encode(JSON.stringify(manifest))
   assert.deepEqual(await parseManifestBytes(oldBytes), parseManifest(JSON.stringify(manifest)))
+})
+
+test('large LFS commits are bounded and publish metadata only in the final batch', () => {
+  const metadata = [{ path: 'manifest.enc' }, { path: 'thumbs_page_0.bundle' }]
+  const pointers = Array.from({ length: 101 }, (_, index) => ({
+    path: `files/${index}.enc`,
+  }))
+  const batches = planCommitBatches(metadata, pointers)
+
+  assert.equal(batches.length, 3)
+  for (const batch of batches) {
+    assert.ok(batch.lfsFilesToCommit.length <= MAX_LFS_POINTERS_PER_COMMIT)
+  }
+  assert.deepEqual(batches[0].filesToCommit, [])
+  assert.deepEqual(batches[1].filesToCommit, [])
+  assert.deepEqual(batches[2].filesToCommit, [metadata[1], metadata[0]])
+  assert.equal(batches[2].filesToCommit.at(-1).path, 'manifest.enc')
+  assert.equal(
+    batches.reduce((count, batch) => count + batch.lfsFilesToCommit.length, 0),
+    pointers.length,
+  )
+})
+
+test('abortable upload waits stop immediately', async () => {
+  const controller = new AbortController()
+  const waiting = abortableDelay(10_000, controller.signal)
+  controller.abort()
+  await assert.rejects(waiting, (error) => error.name === 'AbortError')
+})
+
+test('many encrypted thumbnail pages are staged before the manifest', () => {
+  const pages = Array.from({ length: 95 }, (_, index) => ({
+    path: `thumbs_page_${index}.bundle`,
+  }))
+  const manifest = { path: 'manifest.enc' }
+  const batches = planCommitBatches([...pages, manifest], [])
+
+  assert.equal(batches.length, 3)
+  assert.equal(batches[0].filesToCommit.length, MAX_HF_OPERATIONS_PER_COMMIT)
+  assert.equal(batches[1].filesToCommit.length, MAX_HF_OPERATIONS_PER_COMMIT)
+  assert.equal(batches[2].filesToCommit.length, 16)
+  assert.equal(batches[0].filesToCommit.some((file) => file.path === manifest.path), false)
+  assert.equal(batches[1].filesToCommit.some((file) => file.path === manifest.path), false)
+  assert.equal(batches[2].filesToCommit.at(-1).path, manifest.path)
 })
