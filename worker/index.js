@@ -56,7 +56,7 @@ const ALLOWED_HEADERS = 'Content-Type, Authorization, X-Vault-SHA256, X-Vault-Si
 const CORS_MAX_AGE = '86400'
 
 // files/** are stored via LFS so large videos don't bloat the git repo.
-const GITATTRIBUTES_CONTENT = 'files/** filter=lfs diff=lfs merge=lfs -text\n'
+const LFS_PATTERNS = ['files/**', 'manifest.enc', 'salt.bin', 'thumbs*.bundle']
 
 // Bounded retry schedule for legacy (non-CAS) commits. `Retry-After` /
 // `X-RateLimit-Reset` override individual delays when present.
@@ -180,6 +180,7 @@ export default {
         method: request.method,
         code: error.code || 'STORAGE_FAILED',
         upstreamStatus: error.upstreamStatus || null,
+        upstreamReason: error.upstreamReason || null,
         durationMs: Date.now() - startedAt,
         stack: error.stack,
       })
@@ -673,10 +674,8 @@ async function deleteMedia({ request, env }) {
   for (const path of deletePaths) {
     lines.push(JSON.stringify({ key: 'deletedFile', value: { path } }))
   }
-  lines.push(JSON.stringify({
-    key: 'file',
-    value: { path: 'manifest.enc', content: manifestBytesBase64, encoding: 'base64' },
-  }))
+  await ensureGitAttributes(env)
+  lines.push(JSON.stringify(await stageMetadataOperation(env, { path: 'manifest.enc', content: manifestBytesBase64 })))
 
   const result = await postHfCommit(
     env,
@@ -1244,10 +1243,14 @@ async function ensureGitAttributes(env) {
         content = await response.text()
       }
 
-      if (!content.split(/\r?\n/).some((line) => line.startsWith('files/** '))) {
+      const lines = content.split(/\r?\n/)
+      const missingPatterns = LFS_PATTERNS.filter((pattern) => !lines.some((line) =>
+        line === `${pattern} filter=lfs diff=lfs merge=lfs -text`,
+      ))
+      if (missingPatterns.length > 0) {
         const separator = content.length > 0 && !content.endsWith('\n') ? '\n' : ''
         const bytes = new TextEncoder().encode(
-          `${content}${separator}${GITATTRIBUTES_CONTENT}`,
+          `${content}${separator}${missingPatterns.map((pattern) => `${pattern} filter=lfs diff=lfs merge=lfs -text\n`).join('')}`,
         )
         await hfGitCommit(env, '.gitattributes', bytes, 'Configure LFS for files/')
       }
@@ -1305,25 +1308,26 @@ async function hfGitCommitOnce(env, summary, filesToCommit, lfsFilesToCommit, op
 
   const lines = [JSON.stringify({ key: 'header', value: header })]
 
-  for (const f of filesToCommit) {
-    lines.push(
-      JSON.stringify({
-        key: 'file',
-        value: { path: f.path, content: f.content, encoding: 'base64' },
-      }),
-    )
-  }
-
   for (const lf of lfsFilesToCommit) {
-    lines.push(
-      JSON.stringify({
-        key: 'lfsFile',
-        value: { path: lf.path, algo: 'sha256', size: lf.size, oid: lf.oid },
-      }),
-    )
+    lines.push(JSON.stringify({ key: 'lfsFile', value: {
+      path: lf.path, algo: 'sha256', size: lf.size, oid: lf.oid,
+    } }))
+  }
+  // Metadata remains in the final atomic transaction, but encrypted bytes
+  // must be stored as LFS objects too. HF rejects binary regular Git files.
+  for (const file of filesToCommit) {
+    lines.push(JSON.stringify(await stageMetadataOperation(env, file)))
   }
 
   return postHfCommit(env, lines.join('\n'), 'commit-batch', { parentCommit: options.parentCommit })
+}
+
+async function stageMetadataOperation(env, file) {
+  const bytes = base64ToBytes(file.content)
+  if (!bytes.byteLength) throw httpError(400, 'INVALID_METADATA', 'Encrypted metadata cannot be empty')
+  const oid = await sha256Hex(bytes)
+  await hfUploadStream(env, file.path, new Response(bytes).body, bytes.byteLength, oid)
+  return { key: 'lfsFile', value: { path: file.path, algo: 'sha256', size: bytes.byteLength, oid } }
 }
 
 /**
@@ -1377,7 +1381,36 @@ async function postHfCommit(env, ndjson, context, options = {}) {
 async function hfError(res, context) {
   const err = new Error(`HF ${res.status} ${context}`)
   err.upstreamStatus = res.status
-  if (res.status === 409) {
+  // Keep useful storage diagnostics in server logs only. Bound the error body,
+  // extract just its message, and redact credentials before logging.
+  try {
+    let message = res.headers.get('X-Error-Message') || ''
+    if (!message && res.body) {
+      const reader = res.body.getReader()
+      const parts = []
+      let length = 0
+      try {
+        while (length <= 4096) {
+          const { done, value } = await reader.read()
+          if (done) break
+          length += value.byteLength
+          if (length > 4096) { await reader.cancel(); break }
+          parts.push(value)
+        }
+        if (length <= 4096) {
+          const bytes = new Uint8Array(length)
+          let offset = 0
+          for (const part of parts) { bytes.set(part, offset); offset += part.byteLength }
+          const text = new TextDecoder().decode(bytes)
+          try { const body = JSON.parse(text); message = typeof body.error === 'string' ? body.error : '' }
+          catch { message = text }
+        }
+      } finally { reader.releaseLock() }
+    }
+    err.upstreamReason = message.replace(/hf_[A-Za-z0-9]+/g, '[redacted]')
+      .replace(/Bearer\s+[^\s"<>]+/gi, 'Bearer [redacted]').slice(0, 512)
+  } catch { /* Diagnostics never replace the original upstream failure. */ }
+  if (res.status === 409 || res.status === 412) {
     err.status = 409
     err.code = 'VAULT_STALE'
     err.retryable = false

@@ -667,12 +667,20 @@ async function handleShellFetch(request) {
       await cache.put(cacheKey, response.clone()).catch(() => {})
     }
     return response
-  } catch (error) {
+  } catch {
     if (cache && navigation) {
-      const cached = await cache.match(new URL('/index.html', self.location.origin).href)
-      if (cached) return cached
+      try {
+        const cached = await cache.match(new URL('/index.html', self.location.origin).href)
+        if (cached) return cached
+      } catch { /* Browser storage may be unavailable or evicted. */ }
     }
-    throw error
+    // respondWith must always settle to a Response. On a fresh/evicted cache
+    // an offline navigation cannot render the app; return a useful HTTP error
+    // instead of rejecting the FetchEvent and showing a browser network error.
+    return new Response('VaultPhotos cannot reach the server. Reconnect and reload this page.', {
+      status: 503,
+      headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' },
+    })
   }
 }
 

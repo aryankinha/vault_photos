@@ -424,3 +424,22 @@ test('owner-code stream authentication is sent only to the Worker and cleared on
   assert.equal(session.ownerToken, '')
   assert.equal(session.key, null)
 })
+
+test('offline shell navigation returns cached HTML or an explicit 503, even when cache storage fails', async () => {
+  for (const state of ['hit', 'miss', 'broken', 'unavailable']) {
+    const context = createContext()
+    context.fetch = async () => { throw new TypeError('Failed to fetch') }
+    if (state !== 'unavailable') context.caches = {
+      async open() { return {
+        async match() {
+          if (state === 'broken') throw new Error('Storage unavailable')
+          return state === 'hit' ? new Response('cached shell') : undefined
+        },
+      } },
+    }
+    const response = await context.handleShellFetch({ method: 'GET', mode: 'navigate',
+      url: 'https://app.example/gallery', headers: new Headers() })
+    assert.equal(response.status, state === 'hit' ? 200 : 503)
+    assert.match(await response.text(), state === 'hit' ? /cached shell/ : /Reconnect and reload/)
+  }
+})

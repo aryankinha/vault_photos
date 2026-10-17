@@ -139,7 +139,7 @@ function installFetch(t, putHandler) {
       return Response.json([{ path: '.gitattributes', type: 'file' }])
     }
     if (url.includes('/resolve/main/.gitattributes')) {
-      return new Response('files/** filter=lfs diff=lfs merge=lfs -text\n')
+      return new Response('files/** filter=lfs diff=lfs merge=lfs -text\nmanifest.enc filter=lfs diff=lfs merge=lfs -text\nsalt.bin filter=lfs diff=lfs merge=lfs -text\nthumbs*.bundle filter=lfs diff=lfs merge=lfs -text\n')
     }
     if (url.includes('/objects/batch')) {
       const requested = JSON.parse(String(init.body)).objects[0]

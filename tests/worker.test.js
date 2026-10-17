@@ -1,3 +1,4 @@
+import { Buffer } from 'node:buffer'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
@@ -39,10 +40,14 @@ function installFetch(t, handler, options = {}) {
   globalThis.fetch = async (input, init = {}) => {
     const url = String(input)
     if (url.includes('/resolve/main/.gitattributes')) {
-      return new Response('files/** filter=lfs diff=lfs merge=lfs -text\n')
+      return new Response('files/** filter=lfs diff=lfs merge=lfs -text\nmanifest.enc filter=lfs diff=lfs merge=lfs -text\nsalt.bin filter=lfs diff=lfs merge=lfs -text\nthumbs*.bundle filter=lfs diff=lfs merge=lfs -text\n')
     }
     if (/\/tree\/[^/]+\/\?/.test(url)) {
       return Response.json(rootTree)
+    }
+    if (url.includes('/info/lfs/objects/batch') && !options.metadataUpload) {
+      const { objects } = JSON.parse(init.body)
+      return Response.json({ objects })
     }
     return handler(url, init)
   }
@@ -112,10 +117,10 @@ test('commit-batch splits pointer operations and publishes metadata last', async
   assert.equal(commits.length, 3)
   assert.equal(countNdjsonKey(commits[0], 'lfsFile'), 40)
   assert.equal(countNdjsonKey(commits[1], 'lfsFile'), 40)
-  assert.equal(countNdjsonKey(commits[2], 'lfsFile'), 1)
+  assert.equal(countNdjsonKey(commits[2], 'lfsFile'), 3)
   assert.equal(countNdjsonKey(commits[0], 'file'), 0)
   assert.equal(countNdjsonKey(commits[1], 'file'), 0)
-  assert.equal(countNdjsonKey(commits[2], 'file'), 2)
+  assert.equal(countNdjsonKey(commits[2], 'file'), 0)
   assert.equal(lastFileOp(commits[2]).value.path, 'manifest.enc')
 })
 
@@ -137,12 +142,12 @@ test('every metadata file (including existing bundle pages) publishes only in th
   assert.equal(commits.length, 3)
   assert.equal(countNdjsonKey(commits[0], 'file'), 0)
   assert.equal(countNdjsonKey(commits[1], 'file'), 0)
-  assert.equal(countNdjsonKey(commits[2], 'file'), 3)
-  assert.equal(countNdjsonKey(commits[2], 'lfsFile'), 20)
+  assert.equal(countNdjsonKey(commits[2], 'file'), 0)
+  assert.equal(countNdjsonKey(commits[2], 'lfsFile'), 23)
   const filePaths = commits[2]
     .split('\n')
     .map((line) => JSON.parse(line))
-    .filter((line) => line.key === 'file')
+    .filter((line) => line.key === 'lfsFile' && !line.value.path.startsWith('files/'))
     .map((line) => line.value.path)
   assert.deepEqual(new Set(filePaths), new Set([
     'thumbs_page_3.bundle',
@@ -400,7 +405,7 @@ function installUploadFetch(t, state) {
       return Response.json({ ok: true })
     }
     throw new Error(`Unexpected fetch: ${url}`)
-  })
+  }, { metadataUpload: true })
 }
 
 function uploadFileRequest(ciphertext, sha256) {
@@ -637,7 +642,7 @@ test('POST /delete-media targets exactly one layout per id and commits atomicall
   assert.equal(commits.length, 1)
   const body = commits[0]
   assert.equal(parseHeader(body).parentCommit, PARENT)
-  assert.equal(countNdjsonKey(body, 'file'), 1)
+  assert.equal(countNdjsonKey(body, 'lfsFile'), 1)
   const deletedPaths = body.split('\n')
     .map((line) => JSON.parse(line))
     .filter((line) => line.key === 'deletedFile')
@@ -817,6 +822,83 @@ function lastFileOp(value) {
   return value
     .split('\n')
     .map((line) => JSON.parse(line))
-    .filter((line) => line.key === 'file')
+    .filter((line) => line.key === 'lfsFile' && !line.value.path.startsWith('files/'))
     .at(-1)
 }
+
+test('encrypted manifest and legacy/paged thumbnail bundles upload to LFS before atomic publication', async (t) => {
+  const uploaded = new Map()
+  const verified = new Set()
+  const metadata = new Map([
+    ['manifest.enc', Uint8Array.of(1, 2, 3)],
+    ['thumbs.bundle', Uint8Array.of(4, 5, 6)],
+    ['thumbs_page_0.bundle', Uint8Array.of(7, 8, 9)],
+  ])
+  const expected = new Map(await Promise.all([...metadata].map(async ([path, bytes]) => [await sha256Hex(bytes), { path, bytes }])))
+  let committed = false
+  installFetch(t, async (url, init) => {
+    if (url.includes('/objects/batch')) {
+      const { objects } = JSON.parse(init.body)
+      const object = objects[0]
+      assert.ok(expected.has(object.oid))
+      return Response.json({ objects: [{ ...object, actions: {
+        upload: { href: `https://storage.example/put/${object.oid}` },
+        verify: { href: `https://storage.example/verify/${object.oid}` },
+      } }] })
+    }
+    if (url.includes('https://storage.example/put/')) {
+      const oid = url.split('/').at(-1)
+      const bytes = new Uint8Array(await new Response(init.body).arrayBuffer())
+      assert.deepEqual(bytes, expected.get(oid).bytes)
+      uploaded.set(oid, bytes)
+      return new Response(null, { status: 200 })
+    }
+    if (url.includes('https://storage.example/verify/')) {
+      const { oid, size } = JSON.parse(init.body)
+      assert.equal(uploaded.get(oid).length, size)
+      verified.add(oid)
+      return new Response(null, { status: 200 })
+    }
+    if (url.includes('/commit/main')) {
+      const operations = init.body.split('\n').map(JSON.parse)
+      assert.equal(operations[0].value.parentCommit, PARENT)
+      assert.equal(operations.at(-1).value.path, 'manifest.enc')
+      for (const operation of operations.slice(1)) {
+        assert.equal(operation.key, 'lfsFile', 'HF rejects encrypted metadata as regular Git binary files')
+        assert.ok(verified.has(operation.value.oid), 'each metadata object is verified before publication')
+        assert.equal(expected.get(operation.value.oid).path, operation.value.path)
+      }
+      committed = true
+      return Response.json({ commitOid: 'b'.repeat(40) })
+    }
+    throw new Error(`Unexpected request ${url}`)
+  }, { metadataUpload: true })
+  const b64 = (path) => Buffer.from(metadata.get(path)).toString('base64')
+  const response = await worker.fetch(postJson('/commit-batch', {
+    parentCommit: PARENT, manifestBytesBase64: b64('manifest.enc'),
+    bundleBytesBase64: b64('thumbs.bundle'), bundlePages: [{ pageIndex: 0, bytesBase64: b64('thumbs_page_0.bundle') }],
+  }), env)
+  assert.equal(response.status, 200)
+  assert.equal(uploaded.size, 3)
+  assert.equal(committed, true)
+})
+
+test('HF 412 precondition failures are stale-vault conflicts so the client can rebase', async (t) => {
+  let commits = 0
+  installFetch(t, async (url) => {
+    if (url.includes('/commit/main')) {
+      commits += 1
+      return Response.json({ error: 'The branch was updated since you opened this page. Please refresh and try again.' }, { status: 412 })
+    }
+    throw new Error(`Unexpected request ${url}`)
+  })
+  const response = await worker.fetch(postJson('/commit-batch', {
+    parentCommit: PARENT, manifestBytesBase64: 'AQ==',
+  }), env)
+  assert.equal(response.status, 409)
+  const body = await response.json()
+  assert.equal(body.code, 'VAULT_STALE')
+  assert.equal(body.retryable, false)
+  assert.equal(body.upstreamStatus, 412)
+  assert.equal(commits, 1)
+})
