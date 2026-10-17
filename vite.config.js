@@ -4,9 +4,12 @@ import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 
 // https://vite.dev/config/
-export default defineConfig(({ mode }) => {
+export default defineConfig(({ mode, command }) => {
   const env = loadEnv(mode, process.cwd(), '')
   const workerOrigin = getHttpOrigin(env.VITE_WORKER_URL)
+  if (command === 'build' && !workerOrigin) {
+    throw new Error('Set VITE_WORKER_URL to a valid Worker URL before building VaultPhotos.')
+  }
 
   return {
     plugins: [

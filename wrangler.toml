@@ -2,11 +2,34 @@ name = "vaultphotos-proxy"
 main = "worker/index.js"
 compatibility_date = "2026-06-22"
 
-# Set these as secrets (never commit real values):
+# Workers Logs / traces. Every write and every failure is emitted as structured
+# JSON (see worker/index.js) so it is queryable once observability is enabled.
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+# Secrets (never commit real values):
 #   npx wrangler secret put HF_TOKEN
 #   npx wrangler secret put HF_REPO    # e.g. yourname/vaultphotos
 #
 # HF_REPO may also be set as a plain var here for non-secret values, but using
 # secrets for both keeps the target repo private.
 [vars]
+# Comma-separated browser origins allowed to WRITE to the vault, e.g.
+#   ALLOWED_ORIGIN = "https://vaultphotos.example,https://vaultphotos.vercel.app"
+#
+# Writes are fail-closed: if this is unset every POST is rejected with 403.
+# Every production request also requires a verified Cloudflare Access JWT.
+# Configure the gateway and its public verification settings:
+# ACCESS_TEAM_DOMAIN = "https://your-team.cloudflareaccess.com"
+# ACCESS_AUD = "your-access-application-aud-tag"
+# Optional additional identity allowlist (never replaces the Access policy):
+# ACCESS_EMAILS = "owner@example.com"
+# Local dev ONLY: put ENVIRONMENT=development in .dev.vars. The bypass is
+# restricted to literal HTTP loopback request URLs and never public hosts.
+#
+# Mutating metadata routes require a `parentCommit` (compare-and-swap) read from
+# GET /vault-head; media uploads must be staged with `commit=false` and are
+# published only by the atomic POST /commit-batch.
+# ALLOWED_ORIGIN = "https://your-app.example"
 # HF_REPO = "your-username/vaultphotos"

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import { groupByMonth } from '../utils/dateGroup'
 import { DateGroup } from './DateGroup'
 import { PhotoCard } from './PhotoCard'
@@ -38,7 +38,10 @@ export function PhotoGrid({ entries, thumbs, optimisticStates, onRetry }) {
   if (entries.length === 0) return null
 
   return (
-    <div className="mx-auto max-w-6xl px-3 py-4">
+    <div
+      className="mx-auto max-w-6xl px-3 py-4"
+      style={{ contentVisibility: 'auto' }}
+    >
       {groups.map((group) => (
         <DateGroup key={group.key} label={group.label}>
           <div className="grid grid-cols-3 gap-1.5 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6">
@@ -58,7 +61,15 @@ export function PhotoGrid({ entries, thumbs, optimisticStates, onRetry }) {
   )
 }
 
-function LazyPhotoCard({ entry, thumbBlob, uploadState, onRetry }) {
+/**
+ * LazyPhotoCard — memoized so that updating one thumbnail does not re-render
+ * every card in the grid. The thumbBlob reference is stable (same Blob object
+ * from the thumbs Map), so shallow comparison prevents unnecessary renders.
+ *
+ * Object URLs are created only when the card scrolls near the viewport and
+ * revoked when it leaves — keeping memory bounded for large galleries.
+ */
+const LazyPhotoCard = memo(function LazyPhotoCard({ entry, thumbBlob, uploadState, onRetry }) {
   const containerRef = useRef(null)
   const urlRef = useRef(null)
   const [thumbUrl, setThumbUrl] = useState(null)
@@ -100,4 +111,4 @@ function LazyPhotoCard({ entry, thumbBlob, uploadState, onRetry }) {
       />
     </div>
   )
-}
+})

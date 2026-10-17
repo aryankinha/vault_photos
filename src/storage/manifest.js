@@ -22,8 +22,17 @@ import * as worker from './workerClient'
 // Public API — signatures unchanged
 // ---------------------------------------------------------------------------
 
-export async function loadManifest() {
-  const buffer = await worker.getManifest()
+/**
+ * Load and decrypt the current manifest.
+ *
+ * @param {string|undefined} [revision] — optional CAS revision (vault-head
+ *   commit oid) to read a specific committed manifest instead of `main`.
+ *   Forwarded to worker.getManifest(revision), which the worker client maps to
+ *   the revision-scoped route. Reads are NEVER cached here — compare-and-swap
+ *   callers (delete/finalize) require a fresh view of the head.
+ */
+export async function loadManifest(revision) {
+  const buffer = await worker.getManifest(revision)
   const decrypted = await decryptPacked(buffer, getActiveKey())
   return parseManifestBytes(decrypted)
 }

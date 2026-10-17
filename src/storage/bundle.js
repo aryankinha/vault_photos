@@ -24,10 +24,16 @@ import * as worker from './workerClient'
 // Existing exports — UNCHANGED
 // ---------------------------------------------------------------------------
 
-export async function loadBundle() {
+/**
+ * Load the legacy (non-paged) thumbnail bundle.
+ *
+ * @param {string} [revision] — optional CAS revision (vault-head commit oid);
+ *   forwarded to worker.getBundle(revision). Reads are never cached here.
+ */
+export async function loadBundle(revision) {
   let buffer
   try {
-    buffer = await worker.getBundle()
+    buffer = await worker.getBundle(revision)
   } catch (error) {
     if (error.status === 404) return []
     throw error
@@ -92,12 +98,14 @@ async function loadRawBundleBuffer() {
  * this is the normal state for old single-bundle vaults or pages not yet written.
  *
  * @param {number} pageIndex — zero-based page index
+ * @param {string} [revision] — optional CAS revision (vault-head commit oid);
+ *   forwarded to worker.getBundlePage(index, revision). Reads are never cached.
  * @returns {Promise<{ id: string, offset: number, length: number, bytes: Uint8Array }[]>}
  */
-export async function loadBundlePage(pageIndex) {
+export async function loadBundlePage(pageIndex, revision) {
   let buffer
   try {
-    buffer = await worker.getBundlePage(pageIndex)
+    buffer = await worker.getBundlePage(pageIndex, revision)
   } catch (error) {
     if (error.status === 404) return []
     throw error

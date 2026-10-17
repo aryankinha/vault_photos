@@ -1,9 +1,9 @@
-import { useState } from 'react'
+import { memo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { AlertTriangle, ImageOff, Lock, Play, WifiOff } from 'lucide-react'
 import { usePrefetch } from '../hooks/usePrefetch'
 
-export function PhotoCard({ entry, thumbUrl, onClick, uploadState, onRetry, prefetchEntry }) {
+export const PhotoCard = memo(function PhotoCard({ entry, thumbUrl, onClick, uploadState, onRetry, prefetchEntry }) {
   const navigate = useNavigate()
   const [failedUrl, setFailedUrl] = useState(null)
   const prefetchTarget = prefetchEntry ?? (uploadState ? null : entry)
@@ -106,7 +106,7 @@ export function PhotoCard({ entry, thumbUrl, onClick, uploadState, onRetry, pref
       )}
     </div>
   )
-}
+})
 
 function ProgressRing({ progress = 0 }) {
   const radius = 17
@@ -144,6 +144,6 @@ function formatDuration(seconds) {
   return `${minutes}:${remainder.toString().padStart(2, '0')}`
 }
 
-export function VideoThumb({ entry, thumbUrl, onClick }) {
+export const VideoThumb = memo(function VideoThumb({ entry, thumbUrl, onClick }) {
   return <PhotoCard entry={entry} thumbUrl={thumbUrl} onClick={onClick} />
-}
+})

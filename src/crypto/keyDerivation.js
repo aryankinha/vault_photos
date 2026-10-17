@@ -2,12 +2,13 @@
 // `argon2-browser` entry does `require('../dist/argon2.wasm')`, which Vite
 // cannot resolve at build time. The bundled build sidesteps that entirely.
 import argon2 from 'argon2-browser/dist/argon2-bundled.min.js'
+import { DEFAULT_KDF_PARAMS } from './kdfParams.js'
 
 const ARGON2_OPTIONS = {
-  time: 3,
-  mem: 65536,
-  parallelism: 4,
-  hashLen: 32,
+  time: DEFAULT_KDF_PARAMS.time,
+  mem: DEFAULT_KDF_PARAMS.memKiB,
+  parallelism: DEFAULT_KDF_PARAMS.parallelism,
+  hashLen: DEFAULT_KDF_PARAMS.hashLen,
   type: argon2.ArgonType.Argon2id,
 }
 
@@ -61,3 +62,8 @@ export function clearActiveKey() {
     navigator.serviceWorker?.controller?.postMessage({ type: 'vault-stream-clear' })
   }
 }
+
+// KDF sidecar codec re-exports — see kdfParams.js. The sidecar upload route is
+// intentionally NOT part of the worker API yet (deferred; must never disturb
+// the existing salt, which would brick every existing unlock).
+export { DEFAULT_KDF_PARAMS, decodeKdfParamsSidecar, encodeKdfParamsSidecar } from './kdfParams.js'

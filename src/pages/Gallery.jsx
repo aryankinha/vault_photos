@@ -1,9 +1,10 @@
 import { useState, useMemo, useEffect, useRef, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { ImageOff, Loader2, RefreshCw, LayoutGrid, Image as ImageIcon, Film, Upload, Trash2 } from 'lucide-react'
+import { ImageOff, Loader2, RefreshCw, LayoutGrid, Image as ImageIcon, Film, Upload, Trash2, FileQuestion } from 'lucide-react'
 import { Topbar } from '../components/Topbar'
 import { PhotoGrid } from '../components/PhotoGrid'
 import { useGallery } from '../hooks/useGallery'
+import { computeNextPage } from '../services/galleryService'
 import { useUploadContext } from '../context/useUploadContext'
 import { getUserErrorMessage } from '../utils/errors'
 import { hasActiveKey } from '../crypto/keyDerivation'
@@ -24,8 +25,11 @@ export function Gallery() {
     resumePendingUploads,
     pendingUploadCount,
     discardPendingUploads,
+    pendingUploads,
   } = useUploadContext()
   const [filter, setFilter] = useState('all')
+  const reselectRef = useRef(null)
+  const [reselectTargetId, setReselectTargetId] = useState(null)
 
   // Auto-reload when background upload finishes
   const wasUploadingRef = useRef(false)
@@ -83,12 +87,17 @@ export function Gallery() {
   // ---------------------------------------------------------------------------
   const sentinelRef = useRef(null)
 
-  const nextPage = useMemo(() => {
-    for (let p = 0; p < totalPages; p++) {
-      if (!loadedPages.has(p)) return p
-    }
-    return null  // all pages loaded
-  }, [totalPages, loadedPages])
+  // Load pages in display order (newest first) instead of numerical order.
+  // computeNextPage walks the newest-first entry list and returns the page of
+  // the first entry that is not yet visible — this ensures the user sees new
+  // content before old placeholders.
+  const nextPage = useMemo(() => computeNextPage(
+    mergedEntries,
+    totalPages,
+    loadedPages,
+    mergedThumbs,
+    optimisticStates,
+  ), [mergedEntries, totalPages, loadedPages, mergedThumbs, optimisticStates])
 
   const handleLoadNextPage = useCallback(() => {
     if (nextPage !== null && !loadingPage && !pageError) {
@@ -159,31 +168,96 @@ export function Gallery() {
       )}
 
       {pendingUploadCount > 0 && !isUploading && (
-        <div className="border-b border-amber-500/15 bg-amber-500/5 px-4 py-3">
-          <div className="mx-auto flex max-w-6xl flex-wrap items-center gap-3">
-            <div className="min-w-0 flex-1">
+        <div className="border-b border-amber-500/15 bg-amber-500/5">
+          <div className="mx-auto max-w-6xl px-4 py-3">
+            <div className="mb-2 flex items-center justify-between">
               <p className="text-xs font-semibold text-amber-200">
                 {pendingUploadCount} interrupted {pendingUploadCount === 1 ? 'upload' : 'uploads'}
               </p>
-              <p className="mt-0.5 text-[10px] text-amber-200/60">
-                Recovery is paused so files do not restart without your approval.
-              </p>
+              <button
+                type="button"
+                onClick={() => void discardPendingUploads()}
+                className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-[10px] font-semibold text-amber-100 ring-1 ring-amber-300/20 hover:bg-amber-300/10"
+              >
+                <Trash2 size={11} /> Discard all
+              </button>
             </div>
-            <button
-              type="button"
-              onClick={() => void resumePendingUploads()}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-amber-300 px-3 py-1.5 text-[11px] font-semibold text-neutral-950 hover:bg-amber-200"
-            >
-              <RefreshCw size={12} /> Resume
-            </button>
-            <button
-              type="button"
-              onClick={() => void discardPendingUploads()}
-              className="inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[11px] font-semibold text-amber-100 ring-1 ring-amber-300/20 hover:bg-amber-300/10"
-            >
-              <Trash2 size={12} /> Discard
-            </button>
+
+            {/* Per-row recovery list */}
+            <div className="flex flex-col gap-1.5">
+              {(pendingUploads ?? []).filter((row) => row && row.id).map((row) => {
+                // Whole-file rows carry their ciphertext in the queue and can
+                // resume directly; chunked rows need a source only when chunks
+                // are still missing (sourceFile decorates that case).
+                const directResume = Boolean(row.sourceFile) || !row.chunked
+                return (
+                <div
+                  key={row.id}
+                  className="flex items-center gap-3 rounded-lg bg-amber-500/5 px-3 py-2"
+                >
+                  <FileQuestion size={14} className="shrink-0 text-amber-300/60" />
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-[11px] font-medium text-amber-100">
+                      {row.name || row.entry?.name || row.id}
+                    </p>
+                    <p className="text-[9px] text-amber-200/50">
+                      {row.chunked ? 'Chunked upload' : 'Small upload'} · Ready to resume
+                    </p>
+                  </div>
+
+                  {/* Resume with optional source reselect */}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      // If we have a cached source file, resume directly.
+                      // Otherwise, open a file picker so the user can reselect.
+                      if (directResume) {
+                        void resumePendingUploads([row.id])
+                      } else {
+                        setReselectTargetId(row.id)
+                        reselectRef.current?.click()
+                      }
+                    }}
+                    className="inline-flex items-center gap-1 rounded-lg bg-amber-300 px-2.5 py-1 text-[10px] font-semibold text-neutral-950 hover:bg-amber-200"
+                  >
+                    <RefreshCw size={10} />
+                    {directResume ? 'Resume' : 'Reselect & resume'}
+                  </button>
+
+                  {/* Discard this row */}
+                  <button
+                    type="button"
+                    onClick={() => void discardPendingUploads([row.id])}
+                    className="inline-flex items-center gap-1 rounded-lg px-2 py-1 text-[10px] font-medium text-amber-200/70 ring-1 ring-amber-300/15 hover:bg-amber-300/10"
+                  >
+                    <Trash2 size={10} /> Discard
+                  </button>
+                </div>
+                )
+              })}
+            </div>
+
+            <p className="mt-1.5 text-[9px] text-amber-200/40">
+              Recovery is paused so files do not restart without your approval.
+            </p>
           </div>
+
+          {/* Hidden file input for source reselect */}
+          <input
+            ref={reselectRef}
+            type="file"
+            accept="image/*,video/*"
+            className="hidden"
+            onChange={(e) => {
+              const file = e.target.files?.[0]
+              if (file && reselectTargetId) {
+                const sourceFiles = new Map([[reselectTargetId, file]])
+                void resumePendingUploads([reselectTargetId], sourceFiles)
+              }
+              e.target.value = ''
+              setReselectTargetId(null)
+            }}
+          />
         </div>
       )}
 

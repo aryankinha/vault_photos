@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import {
   AlertTriangle,
@@ -11,6 +11,9 @@ import {
 import { useGallery } from '../hooks/useGallery'
 import { useViewer } from '../hooks/useViewer'
 import { consumePrefetched } from '../hooks/usePrefetch'
+import { DeleteMediaButton } from '../components/DeleteMediaButton'
+
+const MAX_VIDEO_RETRIES = 3
 
 export function Viewer() {
   const { id } = useParams()
@@ -18,6 +21,17 @@ export function Viewer() {
   const { entries, loading: loadingGallery } = useGallery()
   const [retryKey, setRetryKey] = useState(0)
   const [readyVideoUrl, setReadyVideoUrl] = useState(null)
+  const retryCountRef = useRef(0)
+
+  useEffect(() => {
+    retryCountRef.current = 0
+  }, [id])
+
+  const handleVideoError = () => {
+    if (retryCountRef.current >= MAX_VIDEO_RETRIES) return
+    retryCountRef.current += 1
+    setRetryKey((value) => value + 1)
+  }
 
   const entry = useMemo(() => entries.find((item) => item.id === id), [entries, id])
   const currentIndex = useMemo(
@@ -56,6 +70,7 @@ export function Viewer() {
           Back
         </button>
         <span className="truncate text-xs text-neutral-400">{entry?.name}</span>
+        <DeleteMediaButton key={id} entry={entry} onDeleted={goBack} />
         {streaming && readyVideoUrl !== objectUrl && (
           <span className="ml-auto flex items-center gap-1.5 text-[10px] text-neutral-500">
             <Loader2 size={11} className="animate-spin" />
@@ -89,7 +104,11 @@ export function Viewer() {
                   controls
                   autoPlay
                   playsInline
-                  onCanPlay={() => setReadyVideoUrl(objectUrl)}
+                  onError={handleVideoError}
+                  onCanPlay={() => {
+                    retryCountRef.current = 0
+                    setReadyVideoUrl(objectUrl)
+                  }}
                   className={`max-h-[calc(100vh-4rem)] max-w-full rounded-lg transition-opacity ${
                     readyVideoUrl === objectUrl ? 'opacity-100' : 'opacity-0'
                   }`}

@@ -10,7 +10,20 @@
  * JSON routes (preauth/commit) use fetch with JSON bodies.
  */
 
-const WORKER_URL = import.meta.env.VITE_WORKER_URL
+const WORKER_URL = import.meta.env.VITE_WORKER_URL?.replace(/\/$/, '')
+
+/**
+ * When the worker sits behind Cloudflare Access, requests must carry the
+ * visitor's Access session cookies. Configure via VITE_ACCESS_CREDENTIALS:
+ *   'include'     — send cookies cross-origin (Access-protected deployments)
+ *   'same-origin' — same-origin deployments only
+ *   'omit'
+ */
+const ACCESS_CREDENTIALS = ['omit', 'same-origin', 'include'].includes(
+  import.meta.env.VITE_ACCESS_CREDENTIALS,
+)
+  ? import.meta.env.VITE_ACCESS_CREDENTIALS
+  : 'include'
 
 if (!WORKER_URL) {
   // Fail loud in dev if the env var is missing — every call below would 404.
@@ -26,25 +39,41 @@ if (!WORKER_URL) {
 // ---------------------------------------------------------------------------
 
 export async function getSalt() {
-  return getBytes('/get-salt')
+  const bytes = await getBytes('/get-salt', { maxBytes: 16 })
+  if (bytes.byteLength !== 16) throw new Error('The vault salt is damaged; restore the original salt from a backup.')
+  return bytes
 }
 
-export async function getManifest() {
-  return getBytes('/get-manifest')
+/**
+ * Read the current tip commit of the vault dataset.
+ * Inbound contract (worker session): GET /vault-head → { oid: string }.
+ * @returns {Promise<{ oid: string | null }>} parsed via parseVaultHead
+ */
+export async function getVaultHead(options) {
+  return getJson('/vault-head', options)
 }
 
-export async function getBundle() {
-  return getBytes('/get-bundle')
+/**
+ * @param {string} [revision] — head commit oid to pin the read to (snapshot
+ * consistency during finalize). Omitted/undefined keeps legacy unpinned reads.
+ */
+export async function getManifest(revision) {
+  return getBytes('/get-manifest', { revision })
 }
 
-export async function getFile(id) {
-  return getBytes(`/get-file/${id}`)
+/**
+ * @param {string} [revision] — keeps the read pinned to the finalize snapshot.
+ */
+export async function getBundle(revision) {
+  return getBytes('/get-bundle', { revision })
+}
+
+export async function getFile(id, options = {}) {
+  return getBytes(`/get-file/${id}`, { maxBytes: 256 * 1024 * 1024, ...options })
 }
 
 export async function listIds() {
-  const res = await fetch(`${WORKER_URL}/list`)
-  if (!res.ok) throw await httpError(res, 'list')
-  return res.json()
+  return getJson('/list')
 }
 
 // ---------------------------------------------------------------------------
@@ -74,7 +103,7 @@ export async function initializeVault(saltBytes, manifestBytes, bundlePageBytes)
  * @param {((e: {loaded:number,total:number,percent:number}) => void) | undefined} onProgress
  * @param {boolean} [commit] — whether to commit the file to HF in this request
  */
-export async function uploadFile(id, bytes, onProgress, commit = true, options = {}) {
+export async function uploadFile(id, bytes, onProgress, commit = false, options = {}) {
   const commitParam = commit ? '' : '&commit=false'
   return xhrPost(
     `/upload-file?id=${encodeURIComponent(id)}${commitParam}`,
@@ -112,10 +141,11 @@ export async function uploadBundle(bytes, onProgress) {
  * Throws with error.status === 404 if the page does not exist yet.
  *
  * @param {number} pageIndex — zero-based integer
+ * @param {string} [revision] — pin the read to a finalize snapshot
  * @returns {Promise<ArrayBuffer>}
  */
-export async function getBundlePage(pageIndex) {
-  return getBytes(`/get-bundle-page/${pageIndex}`)
+export async function getBundlePage(pageIndex, revision) {
+  return getBytes(`/get-bundle-page/${pageIndex}`, { revision })
 }
 
 /**
@@ -139,8 +169,8 @@ export async function uploadBundlePage(pageIndex, bytes, onProgress) {
  * @param {number} index — zero-based chunk index
  * @returns {Promise<ArrayBuffer>}
  */
-export async function getChunk(id, index) {
-  return getBytes(`/get-chunk/${id}/${index}`)
+export async function getChunk(id, index, options = {}) {
+  return getBytes(`/get-chunk/${id}/${index}`, { maxBytes: 32 * 1024 * 1024 + 32, ...options })
 }
 
 /**
@@ -151,7 +181,7 @@ export async function getChunk(id, index) {
  * @param {((e: {loaded:number,total:number,percent:number}) => void) | undefined} onProgress
  * @returns {Promise<ArrayBuffer>}
  */
-export async function uploadChunk(id, index, bytes, onProgress, commit = true, options = {}) {
+export async function uploadChunk(id, index, bytes, onProgress, commit = false, options = {}) {
   const commitParam = commit ? '' : '&commit=false'
   return xhrPost(
     `/upload-chunk?id=${encodeURIComponent(id)}&index=${index}${commitParam}`,
@@ -192,23 +222,63 @@ export async function commitUpload(id, sha256, size, verifyUrl, verifyHeaders) {
 /**
  * Bulk commit route. Commits multiple LFS file pointers and standard files
  * (manifest and bundle) in a single Git commit transaction.
+ *
+ * Inbound contract (worker session): `parentCommit` (the head oid read before
+ * the finalize snapshots were loaded) is REQUIRED; a stale head returns 409
+ * with `code: 'VAULT_STALE'`, `retryable: false`.
+ *
  * @param {object} payload
  * @param {Array<{id:string, sha256:string, size:number}>} payload.files
+ * @param {Array<{index:number, sha256:string, size:number}>} [payload.chunks]
  * @param {string} [payload.manifestBytesBase64]
  * @param {string} [payload.bundleBytesBase64]
+ * @param {Array<{pageIndex:number, bytesBase64:string}>} [payload.bundlePages]
+ * @param {string} payload.parentCommit — head commit oid (`/vault-head`)
  */
 export async function commitBatch(payload, options = {}) {
   return postJson('/commit-batch', payload, options)
+}
+
+/**
+ * Pointer-delete route (delete flow, W3 sibling contract). The worker takes a
+ * manifest rewrite under the same CAS discipline as commitBatch: stale
+ * parentCommit → 409 `code: 'VAULT_STALE'`.
+ *
+ * @param {object} payload
+ * @param {string} payload.parentCommit — head commit oid (`/vault-head`)
+ * @param {Array<{ id: string, chunk_count?: number }>} payload.ids
+ * @param {string} payload.manifestBytesBase64 — encrypted rewritten manifest
+ */
+export async function deleteMedia(payload, options = {}) {
+  return postJson('/delete-media', payload, options)
 }
 
 // ---------------------------------------------------------------------------
 // Internals
 // ---------------------------------------------------------------------------
 
-async function getBytes(path) {
-  const res = await fetch(`${WORKER_URL}${path}`)
+function buildPath(path, { revision } = {}) {
+  if (!revision) return path
+  const separator = path.includes('?') ? '&' : '?'
+  return `${path}${separator}revision=${encodeURIComponent(revision)}`
+}
+
+async function getBytes(path, options = {}) {
+  const res = await fetch(`${WORKER_URL}${buildPath(path, options)}`, {
+    credentials: ACCESS_CREDENTIALS,
+    signal: options.signal,
+  })
   if (!res.ok) throw await httpError(res, `GET ${path}`)
-  return res.arrayBuffer()
+  return boundedBytes(res, options.maxBytes ?? 64 * 1024 * 1024)
+}
+
+async function getJson(path, options = {}) {
+  const res = await fetch(`${WORKER_URL}${path}`, {
+    credentials: ACCESS_CREDENTIALS,
+    signal: options.signal,
+  })
+  if (!res.ok) throw await httpError(res, `GET ${path}`)
+  return res.json()
 }
 
 /**
@@ -227,6 +297,8 @@ function xhrPost(path, bytes, onProgress, options = {}) {
 
     const xhr = new XMLHttpRequest()
     xhr.open('POST', `${WORKER_URL}${path}`)
+    xhr.timeout = 30 * 60 * 1000
+    if (ACCESS_CREDENTIALS === 'include') xhr.withCredentials = true
     xhr.setRequestHeader('Content-Type', 'application/octet-stream')
     xhr.setRequestHeader('X-Vault-Size', String(body.byteLength))
     if (sha256) xhr.setRequestHeader('X-Vault-SHA256', sha256)
@@ -262,7 +334,13 @@ function xhrPost(path, bytes, onProgress, options = {}) {
           if (responseBody && responseBody.upstreamStatus) {
             details.upstreamStatus = responseBody.upstreamStatus
           }
-        } catch { /* ignore */ }
+        } catch { /* opaque body (e.g. 5xx gateway error page) */ }
+        // Opaque/non-JSON 5xx bodies are gateway transient failures (U5).
+        if (details.retryable === undefined && negativeBodyCheck(xhr.status)) {
+          details.retryable = true
+        }
+        const retryAfter = parseRetryAfter(xhr.getResponseHeader('Retry-After'))
+        if (retryAfter !== null) details.retryAfterMs = retryAfter
         const err = new Error(message)
         err.status = xhr.status
         Object.assign(err, details)
@@ -283,6 +361,14 @@ function xhrPost(path, bytes, onProgress, options = {}) {
       reject(createAbortError())
     }
 
+    xhr.ontimeout = () => {
+      cleanup()
+      const error = new Error('Encrypted upload timed out. The recovery queue is retained.')
+      error.status = 408
+      error.retryable = true
+      reject(error)
+    }
+
     xhr.send(body)
   })
 }
@@ -295,6 +381,7 @@ async function postJson(path, payload, options = {}) {
   const res = await fetch(`${WORKER_URL}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
+    credentials: ACCESS_CREDENTIALS,
     body: JSON.stringify(payload),
     signal: options.signal,
   })
@@ -305,6 +392,7 @@ async function postJson(path, payload, options = {}) {
 async function httpError(res, context) {
   let message = `${context} failed (${res.status})`
   const errorDetails = {}
+  let hadJson = true
   try {
     const body = await res.json()
     if (body && body.error) message = body.error
@@ -313,11 +401,58 @@ async function httpError(res, context) {
     if (body && body.upstreamStatus) errorDetails.upstreamStatus = body.upstreamStatus
   } catch {
     // Response wasn't JSON — keep the default message.
+    hadJson = false
   }
+  // Opaque 5xx bodies are usually gateway transient failures (U5).
+  if (!hadJson && negativeBodyCheck(res.status)) {
+    errorDetails.retryable = true
+  }
+  const retryAfter = parseRetryAfter(res.headers.get('Retry-After'))
+  if (retryAfter !== null) errorDetails.retryAfterMs = retryAfter
   const error = new Error(message)
   error.status = res.status
   Object.assign(error, errorDetails)
   return error
+}
+
+function negativeBodyCheck(status) {
+  return status === 502 || status === 503 || status === 504
+}
+
+/** @param {string | null} value — HTTP Retry-After header (seconds) */
+function parseRetryAfter(value) {
+  if (!value) return null
+  const seconds = Number(value)
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000
+  const date = Date.parse(value)
+  return Number.isFinite(date) ? Math.max(0, date - Date.now()) : null
+}
+
+async function boundedBytes(response, maximum) {
+  if (Number(response.headers.get('Content-Length')) > maximum) {
+    await response.body?.cancel()
+    throw new Error('This encrypted object exceeds the browser download safety limit.')
+  }
+  if (!response.body) throw new Error('Storage returned an empty response')
+  const reader = response.body.getReader()
+  const chunks = []
+  let length = 0
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      length += value.byteLength
+      if (length > maximum) {
+        await reader.cancel()
+        throw new Error('This encrypted object exceeds the browser download safety limit.')
+      }
+      chunks.push(value)
+    }
+  } finally { reader.releaseLock() }
+  const bytes = new Uint8Array(length)
+  let offset = 0
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength }
+  return bytes.buffer
 }
 
 function createAbortError() {

@@ -3,10 +3,25 @@ import {
   isCryptoPoolSupported,
 } from '../workers/cryptoWorkerPool.js'
 import { getActiveKey } from './keyDerivation.js'
+import { resolveCryptoMode } from './context.js'
 
 const NONCE_BYTES = 12
 
-export async function decryptPacked(buffer, key) {
+/**
+ * Unpack and decrypt [nonce | ciphertext+tag].
+ *
+ * @param {ArrayBuffer|Uint8Array} buffer — packed bytes
+ * @param {CryptoKey} key
+ * @param {{ context?: {kind,id?,index?}, cryptoVersion?: 1|2 }} [options]
+ *   - legacy mode (no context, no version or version 1): existing vaults,
+ *     no AAD — byte-identical behaviour to before.
+ *   - context mode (context / crypto_version 2): the canonical context is
+ *     required as AAD. On authentication failure this mode NEVER falls back to
+ *     legacy decryption (audit finding S3 downgrade protection) — a swapped or
+ *     tampered object must fail loudly, not decrypt in the wrong context.
+ */
+export async function decryptPacked(buffer, key, options = {}) {
+  const { aad } = resolveCryptoMode(options)
   const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer)
   if (bytes.byteLength <= NONCE_BYTES) {
     throw new Error('Encrypted payload is too short')
@@ -15,11 +30,9 @@ export async function decryptPacked(buffer, key) {
   const nonce = bytes.slice(0, NONCE_BYTES)
   const ciphertext = bytes.slice(NONCE_BYTES)
 
-  return crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv: nonce, tagLength: 128 },
-    key,
-    ciphertext,
-  )
+  const algorithm = { name: 'AES-GCM', iv: nonce, tagLength: 128 }
+  if (aad) algorithm.additionalData = aad
+  return crypto.subtle.decrypt(algorithm, key, ciphertext)
 }
 
 /**
@@ -32,9 +45,12 @@ export async function decryptPacked(buffer, key) {
  * this call. If you need the original data, copy it first.
  *
  * @param {ArrayBuffer|Uint8Array} buffer — packed [nonce | ciphertext+tag]
+ * @param {CryptoKey} [key]
+ * @param {{ context?: {kind,id?,index?}, cryptoVersion?: 1|2 }} [options] —
+ *   optional crypto context, forwarded to the worker (or main-thread fallback)
  * @returns {Promise<ArrayBuffer>} — plaintext
  */
-export async function decryptPackedOffThread(buffer, key = getActiveKey()) {
+export async function decryptPackedOffThread(buffer, key = getActiveKey(), options = {}) {
   // Always work with an ArrayBuffer for transfer.
   let buf
   if (buffer instanceof ArrayBuffer) {
@@ -45,6 +61,6 @@ export async function decryptPackedOffThread(buffer, key = getActiveKey()) {
   } else {
     buf = buffer
   }
-  if (!isCryptoPoolSupported()) return decryptPacked(buf, key)
-  return poolDecrypt(buf, key)
+  if (!isCryptoPoolSupported()) return decryptPacked(buf, key, options)
+  return poolDecrypt(buf, key, options)
 }

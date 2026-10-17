@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { ShieldCheck, Loader2, AlertTriangle } from 'lucide-react'
 import { unlockWithPassphrase } from '../crypto/keyDerivation'
 import { clearActiveKey } from '../crypto/keyDerivation'
+import { estimatePassphraseStrength, validateNewPassphrase } from '../crypto/passphrasePolicy'
 import { getSalt, initializeVault } from '../storage/workerClient'
 import { decryptPacked } from '../crypto/decrypt'
 import { encryptPacked } from '../crypto/encrypt'
@@ -21,6 +22,13 @@ export function Unlock() {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState(null)
   const [probeKey, setProbeKey] = useState(0)
+
+  // Entropy guidance for the CREATE flow only — informational, never gates
+  // unlock of an existing vault.
+  const strength = useMemo(
+    () => estimatePassphraseStrength(passphrase),
+    [passphrase],
+  )
 
   // On mount, probe the worker for a salt. Missing salt = first run (create mode).
   useEffect(() => {
@@ -55,8 +63,12 @@ export function Unlock() {
 
       try {
         if (mode === 'create') {
-          if (passphrase.length < 8) {
-            throw new UserFacingError('Passphrase must be at least 8 characters')
+          // New-vault policy only (audit S2): min 12 chars + local common-password
+          // rejection. NEVER applied on unlock — existing vaults keep working
+          // with the passphrase they were created with.
+          const policy = validateNewPassphrase(passphrase)
+          if (!policy.ok) {
+            throw new UserFacingError(policy.errors[0])
           }
           if (passphrase !== confirm) {
             throw new UserFacingError('Passphrases do not match')
@@ -150,6 +162,15 @@ export function Unlock() {
               />
             )}
 
+            {isCreate && passphrase.length > 0 && (
+              <div className="space-y-1 text-[11px] leading-relaxed">
+                <StrengthMeter strength={strength} />
+                {strength.suggestions.slice(0, 2).map((suggestion) => (
+                  <p key={suggestion} className="text-neutral-500">{suggestion}</p>
+                ))}
+              </div>
+            )}
+
             {error && (
               <div className="flex items-start gap-2 rounded-lg bg-red-500/10 p-2 text-xs text-red-300">
                 <AlertTriangle size={14} className="mt-0.5 shrink-0" />
@@ -204,6 +225,29 @@ class WrongPassphraseError extends UserFacingError {
     super('Wrong passphrase. Try again.')
     this.name = 'WrongPassphraseError'
   }
+}
+
+const STRENGTH_STYLES = {
+  weak: { label: 'Weak passphrase', text: 'text-red-300', fill: 'bg-red-500', segments: 1 },
+  fair: { label: 'Fair passphrase', text: 'text-amber-300', fill: 'bg-amber-400', segments: 2 },
+  strong: { label: 'Strong passphrase', text: 'text-green-300', fill: 'bg-green-500', segments: 3 },
+}
+
+function StrengthMeter({ strength }) {
+  const style = STRENGTH_STYLES[strength.level] ?? STRENGTH_STYLES.weak
+  return (
+    <div className="flex items-center gap-2">
+      <div className="flex flex-1 gap-1" aria-hidden="true">
+        {[1, 2, 3].map((segment) => (
+          <span
+            key={segment}
+            className={`h-1 flex-1 rounded-full ${segment <= style.segments ? style.fill : 'bg-white/10'}`}
+          />
+        ))}
+      </div>
+      <span className={`${style.text} font-medium`}>{style.label}</span>
+    </div>
+  )
 }
 
 async function initializeEncryptedVault(salt, key) {

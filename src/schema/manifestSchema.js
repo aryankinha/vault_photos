@@ -1,5 +1,7 @@
 export const MANIFEST_VERSION = 1
 
+const HEX64 = /^[0-9a-f]{64}$/i
+
 /**
  * Create an empty manifest.
  *
@@ -9,6 +11,7 @@ export const MANIFEST_VERSION = 1
  *   created_at: ISO string,
  *   updated_at: ISO string,
  *   bundle_pages: number,   // total bundle pages; absent on V1/V2 → treated as 1
+ *   revision: number,       // optional monotonic counter for rollback detection (S4)
  *   files: MediaEntry[]
  * }
  *
@@ -18,6 +21,12 @@ export const MANIFEST_VERSION = 1
  *   chunked:      boolean  — true if the file was encrypted in chunks (Feature 5)
  *   chunk_size:   number   — bytes per chunk before encryption
  *   chunk_count:  number   — total number of chunks
+ *
+ * MediaEntry optional integrity/crypto fields (audit findings S3/U6):
+ *   sha256:         string — lowercase hex SHA-256 of the whole-file ciphertext
+ *                            (non-chunked entries)
+ *   chunk_sha256:   string[]— per-chunk hex SHA-256 of the ciphertext, index-aligned
+ *   crypto_version: 1|2    — 1/absent = legacy (no AAD), 2 = context-bound AAD
  */
 export function createEmptyManifest(now = new Date().toISOString()) {
   return {
@@ -63,7 +72,23 @@ export function validateManifest(manifest) {
     }
   }
 
-  manifest.files.forEach(validateMediaEntry)
+  // revision is optional — must be a non-negative integer when present.
+  if (manifest.revision !== undefined) {
+    if (!Number.isInteger(manifest.revision) || manifest.revision < 0) {
+      throw new Error('Manifest revision must be a non-negative integer')
+    }
+  }
+
+  // Duplicate ids would make per-file lookups ambiguous and could silently
+  // shadow an entry, so reject them outright.
+  const seenIds = new Set()
+  manifest.files.forEach((entry) => {
+    if (seenIds.has(entry?.id)) {
+      throw new Error(`Manifest contains duplicate file id: ${entry.id}`)
+    }
+    if (entry && typeof entry.id === 'string') seenIds.add(entry.id)
+    validateMediaEntry(entry)
+  })
 }
 
 export function validateMediaEntry(entry) {
@@ -127,6 +152,58 @@ export function validateMediaEntry(entry) {
     }
     if (!Number.isInteger(entry.chunk_count) || entry.chunk_count <= 0) {
       throw new Error('Chunked media entry must have a valid chunk_count')
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Integrity + crypto-version fields (audit findings S3/U6) — optional
+  // ---------------------------------------------------------------------------
+
+  // sha256: whole-file ciphertext digest (non-chunked entries only).
+  if (entry.sha256 !== undefined) {
+    if (entry.chunked === true) {
+      throw new Error('Chunked media entry must use chunk_sha256, not sha256')
+    }
+    if (typeof entry.sha256 !== 'string' || !HEX64.test(entry.sha256)) {
+      throw new Error('Media entry sha256 must be a 64-char hex string')
+    }
+  }
+
+  // chunk_sha256: per-chunk ciphertext digests, index-aligned, size === chunk_count.
+  if (entry.chunk_sha256 !== undefined) {
+    if (entry.chunked !== true) {
+      throw new Error('chunk_sha256 is only valid on chunked media entries')
+    }
+    if (!Array.isArray(entry.chunk_sha256)) {
+      throw new Error('Media entry chunk_sha256 must be an array')
+    }
+    if (entry.chunk_sha256.length !== entry.chunk_count) {
+      throw new Error(
+        `chunk_sha256 length (${entry.chunk_sha256.length}) must equal chunk_count (${entry.chunk_count})`,
+      )
+    }
+    for (const digest of entry.chunk_sha256) {
+      if (typeof digest !== 'string' || !HEX64.test(digest)) {
+        throw new Error('Every chunk_sha256 entry must be a 64-char hex string')
+      }
+    }
+  }
+
+  // crypto_version: 1 (or absent) = legacy no-AAD, 2 = context-bound AAD.
+  // Version 2 requires its integrity digests so viewers can verify before
+  // decrypt, and so a context-bound object can never be silently downgraded.
+  if (entry.crypto_version !== undefined) {
+    if (entry.crypto_version !== 1 && entry.crypto_version !== 2) {
+      throw new Error(`Unsupported crypto_version: ${entry.crypto_version}`)
+    }
+    if (entry.crypto_version === 2) {
+      if (entry.chunked === true) {
+        if (!Array.isArray(entry.chunk_sha256)) {
+          throw new Error('crypto_version 2 chunked entry must carry chunk_sha256')
+        }
+      } else if (entry.sha256 === undefined) {
+        throw new Error('crypto_version 2 entry must carry sha256')
+      }
     }
   }
 }

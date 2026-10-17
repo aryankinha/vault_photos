@@ -80,7 +80,7 @@ function pumpQueue() {
       taskId: task.taskId,
       buffer: task.buffer,
       key: task.key,
-      ...task.options,
+      ...task.options, // index / context / mediaType / filename
     }
 
     try {
@@ -112,20 +112,42 @@ export function isCryptoPoolSupported() {
   return typeof Worker !== 'undefined'
 }
 
-export function encryptWithPool(buffer, key) {
-  return dispatch('encrypt', buffer, key)
+/**
+ * @param {ArrayBuffer|Uint8Array} buffer
+ * @param {CryptoKey} key
+ * @param {{ context?: {kind,id?,index?} }} [options] — optional crypto context
+ */
+export function encryptWithPool(buffer, key, options = {}) {
+  return dispatch('encrypt', buffer, key, options)
 }
 
-export function decryptWithPool(buffer, key) {
-  return dispatch('decrypt', buffer, key)
+/**
+ * @param {ArrayBuffer|Uint8Array} buffer
+ * @param {CryptoKey} key
+ * @param {{ context?: {kind,id?,index?} }} [options] — optional crypto context
+ */
+export function decryptWithPool(buffer, key, options = {}) {
+  return dispatch('decrypt', buffer, key, options)
 }
 
-export function encryptChunkWithPool(buffer, key, index) {
-  return dispatch('encryptChunk', buffer, key, { index })
+/**
+ * @param {ArrayBuffer|Uint8Array} buffer
+ * @param {CryptoKey} key
+ * @param {number} index
+ * @param {{ context?: {kind,id?,index?} }} [options] — optional crypto context
+ */
+export function encryptChunkWithPool(buffer, key, index, options = {}) {
+  return dispatch('encryptChunk', buffer, key, { ...options, index })
 }
 
-export function decryptChunkWithPool(buffer, key, index) {
-  return dispatch('decryptChunk', buffer, key, { index })
+/**
+ * @param {ArrayBuffer|Uint8Array} buffer
+ * @param {CryptoKey} key
+ * @param {number} index
+ * @param {{ context?: {kind,id?,index?} }} [options] — optional crypto context
+ */
+export function decryptChunkWithPool(buffer, key, index, options = {}) {
+  return dispatch('decryptChunk', buffer, key, { ...options, index })
 }
 
 export function thumbnailWithPool(buffer, mediaType, filename) {

@@ -42,7 +42,7 @@ export function PersistentUploadBar() {
     stage,
   } = progress
 
-  const pct = Math.round(overallPercent * 100)
+  const pct = Math.round(Math.max(0, Math.min(1, Number.isFinite(overallPercent) ? overallPercent : 0)) * 100)
   const errorCount = errors?.length ?? 0
   const actionLabel = stage === 'reading'
     ? 'Reading'
@@ -68,7 +68,7 @@ export function PersistentUploadBar() {
               <span className="font-medium text-neutral-100">{currentFile}</span>
               {totalFiles > 1 && (
                 <span className="ml-1 text-neutral-500">
-                  ({completedFiles + 1} of {totalFiles})
+                   ({Math.min(completedFiles + 1, totalFiles)} of {totalFiles})
                 </span>
               )}
             </>
@@ -76,6 +76,8 @@ export function PersistentUploadBar() {
             <span className="text-neutral-300">Upload cancelled</span>
           ) : stage === 'error' ? (
             <span className="text-red-300">Upload needs attention</span>
+          ) : !isUploading ? (
+            <span className="text-neutral-300">{errorCount ? 'Some uploads need attention' : 'Upload complete'}</span>
           ) : (
             <span className="text-neutral-400">Finalising…</span>
           )}

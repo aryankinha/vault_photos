@@ -9,6 +9,7 @@
  */
 
 import exifr from 'exifr'
+import { encodeCryptoContext } from '../crypto/context.js'
 
 const NONCE_BYTES = 12
 const INDEX_BYTES = 4
@@ -18,19 +19,19 @@ const JPEG_QUALITY = 0.7
 const EXIF_TAGS = ['DateTimeOriginal', 'CreateDate', 'ModifyDate']
 
 self.onmessage = async (event) => {
-  const { operation, taskId, buffer, key, mediaType, filename, index } = event.data
+  const { operation, taskId, buffer, key, mediaType, filename, index, context } = event.data
 
   try {
     let result
 
     if (operation === 'encrypt') {
-      result = await encryptPacked(buffer, key)
+      result = await encryptPacked(buffer, key, context)
     } else if (operation === 'decrypt') {
-      result = await decryptPacked(buffer, key)
+      result = await decryptPacked(buffer, key, context)
     } else if (operation === 'encryptChunk') {
-      result = await encryptChunk(buffer, key, index)
+      result = await encryptChunk(buffer, key, index, context)
     } else if (operation === 'decryptChunk') {
-      result = await decryptChunk(buffer, key, index)
+      result = await decryptChunk(buffer, key, index, context)
     } else if (operation === 'thumbnail') {
       result = await createThumbnail(buffer, mediaType, filename)
     } else if (operation === 'exif') {
@@ -58,35 +59,34 @@ self.onmessage = async (event) => {
 // Crypto primitives mirror the main-thread fallbacks exactly.
 // ---------------------------------------------------------------------------
 
-async function encryptPacked(buffer, key) {
+async function encryptPacked(buffer, key, context = null) {
   const nonce = crypto.getRandomValues(new Uint8Array(NONCE_BYTES))
-  const ciphertext = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv: nonce, tagLength: 128 },
-    key,
-    buffer,
-  )
+  const aad = context ? encodeCryptoContext(context) : null
+  const algorithm = { name: 'AES-GCM', iv: nonce, tagLength: 128 }
+  if (aad) algorithm.additionalData = aad
+  const ciphertext = await crypto.subtle.encrypt(algorithm, key, buffer)
   const output = new Uint8Array(nonce.byteLength + ciphertext.byteLength)
   output.set(nonce, 0)
   output.set(new Uint8Array(ciphertext), nonce.byteLength)
   return output.buffer
 }
 
-async function decryptPacked(buffer, key) {
+async function decryptPacked(buffer, key, context = null) {
   const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer)
   if (bytes.byteLength <= NONCE_BYTES) {
     throw new Error('Encrypted payload is too short')
   }
   const nonce = bytes.slice(0, NONCE_BYTES)
   const ciphertext = bytes.slice(NONCE_BYTES)
-  return crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv: nonce, tagLength: 128 },
-    key,
-    ciphertext,
-  )
+  const algorithm = { name: 'AES-GCM', iv: nonce, tagLength: 128 }
+  if (context) algorithm.additionalData = encodeCryptoContext(context)
+  return crypto.subtle.decrypt(algorithm, key, ciphertext)
 }
 
-async function encryptChunk(buffer, key, index) {
-  const aad = encodeIndex(index)
+async function encryptChunk(buffer, key, index, context = null) {
+  const aad = context
+    ? encodeCryptoContext(withChunkIndex(context, index))
+    : encodeIndex(index)
   const nonce = crypto.getRandomValues(new Uint8Array(NONCE_BYTES))
   const ciphertext = await crypto.subtle.encrypt(
     { name: 'AES-GCM', iv: nonce, tagLength: 128, additionalData: aad },
@@ -94,14 +94,19 @@ async function encryptChunk(buffer, key, index) {
     buffer,
   )
   const output = new Uint8Array(INDEX_BYTES + NONCE_BYTES + ciphertext.byteLength)
-  output.set(aad, 0)
+  output.set(encodeIndex(index), 0)
   output.set(nonce, INDEX_BYTES)
   output.set(new Uint8Array(ciphertext), INDEX_BYTES + NONCE_BYTES)
   return output.buffer
 }
 
-async function decryptChunk(buffer, key, expectedIndex) {
+async function decryptChunk(buffer, key, expectedIndex, context = null) {
   const bytes = new Uint8Array(buffer)
+  if (context) {
+    // Context mode (v2): canonical kind+id+index AAD, current layout only, and
+    // NO legacy fallback on authentication failure (S3 downgrade protection).
+    return decryptContextChunk(bytes, key, expectedIndex, context)
+  }
   if (bytes.byteLength <= INDEX_BYTES + NONCE_BYTES + TAG_BYTES) {
     throw new Error('Encrypted chunk is too short')
   }
@@ -128,6 +133,36 @@ async function decryptChunk(buffer, key, expectedIndex) {
     }
   }
   return decryptLegacyChunk(bytes, key, expectedIndex)
+}
+
+async function decryptContextChunk(bytes, key, expectedIndex, context) {
+  if (bytes.byteLength <= INDEX_BYTES + NONCE_BYTES + TAG_BYTES) {
+    throw new Error('Encrypted chunk is too short')
+  }
+  const storedIndex = new DataView(bytes.buffer, 0, INDEX_BYTES).getUint32(0, false)
+  if (storedIndex !== expectedIndex) {
+    throw new Error(`Encrypted chunk index mismatch: expected ${expectedIndex}`)
+  }
+  return crypto.subtle.decrypt(
+    {
+      name: 'AES-GCM',
+      iv: bytes.slice(INDEX_BYTES, INDEX_BYTES + NONCE_BYTES),
+      tagLength: 128,
+      additionalData: encodeCryptoContext(withChunkIndex(context, expectedIndex)),
+    },
+    key,
+    bytes.slice(INDEX_BYTES + NONCE_BYTES),
+  )
+}
+
+function withChunkIndex(context, index) {
+  if (context.kind !== undefined && context.kind !== 'chunk') {
+    throw new RangeError(`Chunk crypto context kind must be 'chunk', got '${context.kind}'`)
+  }
+  if (context.index !== undefined && context.index !== index) {
+    throw new RangeError(`Crypto context index ${context.index} does not match chunk index ${index}`)
+  }
+  return { ...context, kind: 'chunk', index }
 }
 
 function decryptLegacyChunk(bytes, key, expectedIndex) {

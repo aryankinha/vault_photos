@@ -159,18 +159,25 @@ test('abortable upload waits stop immediately', async () => {
   await assert.rejects(waiting, (error) => error.name === 'AbortError')
 })
 
-test('many encrypted thumbnail pages are staged before the manifest', () => {
+test('oversized metadata sets are rejected instead of staged before the manifest', () => {
   const pages = Array.from({ length: 95 }, (_, index) => ({
     path: `thumbs_page_${index}.bundle`,
   }))
   const manifest = { path: 'manifest.enc' }
-  const batches = planCommitBatches([...pages, manifest], [])
 
-  assert.equal(batches.length, 3)
+  // Publishing mutated metadata pages early could point readers at bundles the
+  // current manifest does not index yet. The atomic planner must refuse instead.
+  assert.throws(
+    () => planCommitBatches([...pages, manifest], []),
+    (error) => error.code === 'METADATA_TOO_LARGE',
+  )
+
+  // A metadata set that fits publishes everything in one atomic commit, with
+  // manifest.enc last.
+  const smallPages = pages.slice(0, 39)
+  const batches = planCommitBatches([...smallPages, manifest], [])
+  assert.equal(batches.length, 1)
   assert.equal(batches[0].filesToCommit.length, MAX_HF_OPERATIONS_PER_COMMIT)
-  assert.equal(batches[1].filesToCommit.length, MAX_HF_OPERATIONS_PER_COMMIT)
-  assert.equal(batches[2].filesToCommit.length, 16)
-  assert.equal(batches[0].filesToCommit.some((file) => file.path === manifest.path), false)
-  assert.equal(batches[1].filesToCommit.some((file) => file.path === manifest.path), false)
-  assert.equal(batches[2].filesToCommit.at(-1).path, manifest.path)
+  assert.equal(batches[0].filesToCommit.at(-1).path, manifest.path)
+  assert.equal(batches[0].lfsFilesToCommit.length, 0)
 })

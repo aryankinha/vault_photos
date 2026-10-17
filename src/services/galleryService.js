@@ -21,10 +21,13 @@ import {
   setCachedThumbs,
   setManifestCache,
 } from '../session/cache'
-import { loadBundle } from '../storage/bundle'
-import { loadBundlePage } from '../storage/bundle'
+import { loadBundle, loadBundlePage } from '../storage/bundle'
 import { loadManifest } from '../storage/manifest'
 import * as workerClient from '../storage/workerClient'
+import { computeInitialPage } from './galleryPage'
+
+// Re-export pure helpers for backward compatibility and testing
+export { computeInitialPage, computeNextPage, shouldMarkPageLoaded } from './galleryPage'
 
 // Number of thumbnails to hydrate per event-loop tick during progressive load.
 const THUMB_BATCH_SIZE = 8
@@ -117,7 +120,11 @@ export async function loadGalleryProgressive(onUpdate) {
   }
 
   if (isPaged) {
-    let pageEntries = await loadBundlePage(0)
+    // Load the page containing the newest uncached entry first. Pages are
+    // numbered sequentially during upload (page 0 = oldest), so loading page 0
+    // first would show the user a wall of old placeholders before new content.
+    const initialPage = computeInitialPage(entries, thumbs)
+    let pageEntries = await loadBundlePage(initialPage)
     // Some interrupted/experimental upgrades wrote bundle_pages: 1 before
     // creating page 0. Preserve the V1/V2 bundle in that state.
     if (
@@ -146,7 +153,7 @@ export async function loadGalleryProgressive(onUpdate) {
       thumbs: new Map(thumbs),
       updatedAt,
       totalPages,
-      loadedPages: new Set([0]),
+      loadedPages: new Set([initialPage]),
       phase: 'done',
       done: true,
     })
@@ -255,11 +262,16 @@ export async function loadGalleryProgressive(onUpdate) {
  *
  * @param {number} pageIndex — zero-based page index
  * @param {string[]} entryIds — ids of entries on this page (from manifest)
- * @returns {Promise<Map<string, Blob>>}
+ * @returns {Promise<{ thumbs: Map<string, Blob>, pageLoaded: boolean }>}
+ *   pageLoaded is false when the page fetch returned no entries but there are
+ *   still missing ids — the caller must NOT mark this page as loaded so the
+ *   sentinel can retry.
  */
 export async function loadGalleryPage(pageIndex, entryIds) {
   const result = new Map()
-  if (!entryIds || entryIds.length === 0) return result
+  if (!entryIds || entryIds.length === 0) {
+    return { thumbs: result, pageLoaded: true }
+  }
 
   // Check IDB cache for all ids on this page in parallel.
   const cachedResults = await Promise.all(
@@ -275,10 +287,21 @@ export async function loadGalleryPage(pageIndex, entryIds) {
     }
   }
 
-  if (missingIds.size === 0) return result  // all from cache
+  if (missingIds.size === 0) {
+    return { thumbs: result, pageLoaded: true }
+  }
 
   // Fetch the bundle page from HF (404 = page not written yet = return what we have).
   const pageEntries = await loadBundlePage(pageIndex)
+
+  // Phantom completeness: the page fetch returned no entries but there are
+  // still missing ids. This happens when a page hasn't been written yet or the
+  // bundle is temporarily unavailable. The caller must NOT mark this page as
+  // loaded — the sentinel stays in place so the user can scroll back to retry.
+  if (pageEntries.length === 0 && missingIds.size > 0) {
+    return { thumbs: result, pageLoaded: false }
+  }
+
   const newlyDecrypted = []
 
   for (const entry of pageEntries) {
@@ -293,7 +316,7 @@ export async function loadGalleryPage(pageIndex, entryIds) {
     void setCachedThumbs(newlyDecrypted).catch(() => {})
   }
 
-  return result
+  return { thumbs: result, pageLoaded: true }
 }
 
 // ---------------------------------------------------------------------------

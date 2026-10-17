@@ -1,5 +1,10 @@
 # VaultPhotos
 
+> Before deploying the hardening changes, read [Deployment safety](DEPLOYMENT-SAFETY.md).
+> The client and Worker now use revision-pinned reads and conflict-checked
+> publication. Configure `ALLOWED_ORIGIN` for your frontend and protect the
+> Worker with identity-based access control; an origin allowlist is not authentication.
+
 Privacy-first encrypted photo and video storage. Photos and videos are
 encrypted **on the client** before being uploaded to a Hugging Face Dataset
 repo. Nobody can view the files without the passphrase — even if the entire HF
@@ -107,11 +112,36 @@ curl -i https://<your-worker>.<subdomain>.workers.dev/get-salt
 
 ## Run the app locally
 
+### Option A — local worker (recommended while developing)
+
+The deployed worker fails closed unless Cloudflare Access is configured, so run
+the worker on your machine while iterating:
+
 ```bash
+cp .dev.vars.example .dev.vars   # fill in HF_TOKEN and HF_REPO
+npm run worker:dev               # wrangler dev → http://127.0.0.1:8787
+npm run dev                      # Vite → http://localhost:5173
+```
+
+`.env.local` (gitignored) points the app at the local worker.
+`ENVIRONMENT=development` in `.dev.vars` disables Access verification **only**
+for literal loopback request URLs — public deployments never get this bypass.
+Uploads go to the same HF Dataset repo named by `HF_REPO`; point it at a
+disposable repo if you want a sandbox.
+
+### Option B — deployed worker
+
+```bash
+cp .env.example .env   # VITE_WORKER_URL=https://<your-worker>.<subdomain>.workers.dev
 npm run dev
 ```
 
-Open the printed URL. The first run shows a **Create vault** screen (passphrase
+The deployed worker requires Cloudflare Access configuration
+(`ACCESS_TEAM_DOMAIN`, `ACCESS_AUD`, `ALLOWED_ORIGIN`) — see
+[Deployment safety](DEPLOYMENT-SAFETY.md). Without it, every request returns
+`503 ACCESS_NOT_CONFIGURED`.
+
+In both cases, the first run shows a **Create vault** screen (passphrase
 twice → atomically initializes the encrypted vault). Subsequent runs show **Unlock**. If you
 enter the wrong passphrase, decryption of the manifest fails and you get a clear
 error — there is no way to detect a wrong passphrase except by trying to decrypt.
@@ -164,11 +194,16 @@ padding remain out of scope.
 ## Scripts
 
 - `npm run dev` — Vite dev server
+- `npm run worker:dev` — run the Cloudflare Worker locally (wrangler dev)
 - `npm run build` — production build to `dist/`
 - `npm run lint` — ESLint
 - `npm test` — schema, crypto, Worker transaction, streaming-upload, abort, and
   backward-compatibility tests
+- `npm audit` — dependency advisory check
 - `npm run preview` — preview the production build locally
 
 The repeatable real-browser worker check lives at
 `/tests/browser/cryptoWorkerHarness.html` while `npm run dev` is running.
+The local `/tests/browser/uploadIntegrationHarness.html` also exposes
+`runUploadIntegration()` for an in-memory end-to-end upload check with real
+browser crypto and IndexedDB. It does not upload to Hugging Face.

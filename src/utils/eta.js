@@ -6,13 +6,15 @@
  */
 
 const WINDOW_SIZE = 5
+const STALE_SAMPLE_MS = 15_000
 
 export class EtaTracker {
   /**
    * @param {number} totalBytes — total bytes expected to transfer
    */
-  constructor(totalBytes) {
-    this._total = totalBytes
+  constructor(totalBytes, now = Date.now) {
+    this._total = Number.isFinite(totalBytes) ? Math.max(0, totalBytes) : 0
+    this._now = now
     /** @type {{ timestamp: number, loaded: number }[]} */
     this._samples = []
   }
@@ -22,7 +24,15 @@ export class EtaTracker {
    * @param {number} loadedBytes
    */
   update(loadedBytes) {
-    this._samples.push({ timestamp: Date.now(), loaded: loadedBytes })
+    if (!Number.isFinite(loadedBytes)) return
+    const timestamp = this._now()
+    const loaded = Math.max(0, Math.min(this._total, loadedBytes))
+    const previous = this._samples.at(-1)
+    // Retries can reset byte progress; pauses should not preserve a stale speed.
+    if (previous && (loaded < previous.loaded || timestamp - previous.timestamp > STALE_SAMPLE_MS)) {
+      this._samples = []
+    }
+    this._samples.push({ timestamp, loaded })
     if (this._samples.length > WINDOW_SIZE) {
       this._samples.shift()
     }
@@ -35,9 +45,13 @@ export class EtaTracker {
   getEta() {
     const samples = this._samples
     const latest = samples[samples.length - 1]
-    const percent = latest ? latest.loaded / this._total : 0
+    const percent = this._total === 0 ? 1 : latest ? latest.loaded / this._total : 0
 
-    if (samples.length < 2) {
+    if (percent === 1) {
+      return { percent, bytesPerSecond: 0, etaSeconds: 0, etaDisplay: '0 sec' }
+    }
+
+    if (samples.length < 2 || this._now() - latest.timestamp > STALE_SAMPLE_MS) {
       return { percent, bytesPerSecond: 0, etaSeconds: Infinity, etaDisplay: 'calculating…' }
     }
 

@@ -23,52 +23,69 @@ export async function createVideoStream(entry, mimeType, callbacks = {}) {
 
   const sessionId = createSessionId()
   const url = `${window.location.origin}${STREAM_PATH_PREFIX}${sessionId}`
-  let cleaned = false
+  const state = {
+    sessionId,
+    url,
+    entry: {
+      id: entry.id,
+      size: entry.size,
+      chunk_size: entry.chunk_size,
+      chunk_count: entry.chunk_count,
+      crypto_version: entry.crypto_version,
+      chunk_sha256: entry.chunk_sha256,
+    },
+    mimeType,
+    callbacks,
+    cleaned: false,
+    controller,
+    registering: null,
+    reRegisterPromise: null,
+    lastProgress: -1,
+  }
 
   const onMessage = (event) => {
     const message = event.data || {}
-    if (message.sessionId !== sessionId) return
+    if (message.sessionId && message.sessionId !== sessionId) return
     if (message.type === 'vault-stream-progress') {
-      callbacks.onProgress?.(message.progress)
+      const percent = Math.round(message.progress * 100)
+      if (Number.isFinite(percent) && percent !== state.lastProgress) {
+        state.lastProgress = percent
+        callbacks.onProgress?.(message.progress)
+      }
     }
     if (message.type === 'vault-stream-error') {
       callbacks.onError?.(new Error(message.error || 'Encrypted video stream failed'))
     }
+    if (message.type === 'vault-stream-expired') {
+      requestReRegister(state).catch((error) => {
+        callbacks.onError?.(error instanceof Error ? error : new Error(String(error)))
+      })
+    }
   }
   navigator.serviceWorker.addEventListener('message', onMessage)
 
-  try {
-    await postWithAck(controller, {
-      type: 'vault-stream-register',
-      sessionId,
-      entry: {
-        id: entry.id,
-        size: entry.size,
-        chunk_size: entry.chunk_size,
-        chunk_count: entry.chunk_count,
-      },
-      mimeType,
-      workerUrl: WORKER_URL,
-      key: getActiveKey(),
-    })
-  } catch (error) {
+  const cleanup = () => {
+    if (state.cleaned) return
+    state.cleaned = true
     navigator.serviceWorker.removeEventListener('message', onMessage)
-    throw error
-  }
-
-  function cleanup() {
-    if (cleaned) return
-    cleaned = true
-    navigator.serviceWorker.removeEventListener('message', onMessage)
-    navigator.serviceWorker.controller?.postMessage({
+    state.controller?.postMessage({
       type: 'vault-stream-remove',
       sessionId,
     })
     activeStreams.delete(sessionId)
   }
+  state.cleanup = cleanup
 
-  activeStreams.set(sessionId, cleanup)
-  return { url, cleanup }
+  activeStreams.set(sessionId, state)
+
+  try {
+    await registerStream(state, controller)
+  } catch (error) {
+    cleanup()
+    throw error
+  }
+
+  return { url, cleanup, sessionId }
 }
 
 // Kept under the existing export name so callers and old tests remain source
@@ -84,8 +101,93 @@ export function isVideoRangeStreamingSupported() {
 export const isMseSupported = isVideoRangeStreamingSupported
 
 export function clearVideoStreams() {
-  for (const cleanup of [...activeStreams.values()]) cleanup()
+  for (const state of [...activeStreams.values()]) {
+    state.cleanup?.()
+  }
   navigator.serviceWorker?.controller?.postMessage({ type: 'vault-stream-clear' })
+}
+
+async function registerStream(state, controller) {
+  if (state.cleaned) return
+  if (state.registering) {
+    await state.registering
+    if (state.cleaned || state.registeredController === controller) return
+  }
+
+  const promise = (async () => {
+    state.controller = controller
+    await postWithAck(controller, {
+      type: 'vault-stream-register',
+      sessionId: state.sessionId,
+      entry: state.entry,
+      mimeType: state.mimeType,
+      workerUrl: WORKER_URL,
+      credentials: ['include', 'same-origin', 'omit'].includes(import.meta.env.VITE_ACCESS_CREDENTIALS)
+        ? import.meta.env.VITE_ACCESS_CREDENTIALS : 'include',
+      key: getActiveKey(),
+    })
+    if (state.cleaned) {
+      controller.postMessage({
+        type: 'vault-stream-remove',
+        sessionId: state.sessionId,
+      })
+      throw new Error('Stream session closed')
+    }
+    state.registeredController = controller
+  })()
+
+  state.registering = promise
+  try {
+    await promise
+  } finally {
+    state.registering = null
+  }
+}
+
+function requestReRegister(state) {
+  if (state.cleaned) return Promise.resolve()
+  if (state.reRegisterPromise) return state.reRegisterPromise
+
+  const promise = (async () => {
+    const controller = await getServiceWorkerController()
+    if (!controller) throw new Error('Service worker unavailable')
+    await registerStream(state, controller)
+  })().finally(() => {
+    state.reRegisterPromise = null
+  })
+
+  state.reRegisterPromise = promise
+  return promise
+}
+
+if (typeof navigator !== 'undefined' && navigator.serviceWorker) {
+  const promoteWaitingServiceWorker = (registration) => {
+    if (registration?.waiting && activeStreams.size === 0) {
+      registration.waiting.postMessage({ type: 'vault-sw-skip-waiting' })
+    }
+  }
+
+  navigator.serviceWorker.ready
+    .then((registration) => {
+      promoteWaitingServiceWorker(registration)
+      registration.addEventListener('updatefound', () => {
+        const worker = registration.installing
+        if (!worker) return
+        worker.addEventListener('statechange', () => {
+          if (worker.state === 'installed') promoteWaitingServiceWorker(registration)
+        })
+      })
+    })
+    .catch(() => {})
+
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    for (const state of [...activeStreams.values()]) {
+      if (state.cleaned) continue
+      requestReRegister(state).catch((error) => {
+        state.callbacks?.onError?.(error instanceof Error ? error : new Error(String(error)))
+      })
+    }
+  })
 }
 
 async function getServiceWorkerController() {
@@ -128,7 +230,14 @@ function postWithAck(controller, message) {
       if (event.data?.ok) resolve()
       else reject(new Error(event.data?.error || 'Unable to initialize video stream'))
     }
-    controller.postMessage(message, [channel.port2])
+    try {
+      controller.postMessage(message, [channel.port2])
+    } catch (error) {
+      clearTimeout(timeout)
+      channel.port1.close()
+      channel.port2.close()
+      reject(error)
+    }
   })
 }
 

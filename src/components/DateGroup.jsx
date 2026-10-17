@@ -1,6 +1,12 @@
 export function DateGroup({ label, children }) {
   return (
-    <section className="mb-6">
+    <section
+      className="mb-6"
+      style={{
+        contentVisibility: 'auto',
+        containIntrinsicSize: 'auto 200px',
+      }}
+    >
       <h2 className="mb-2 px-1 text-xs font-semibold uppercase tracking-wide text-neutral-400">
         {label}
       </h2>

@@ -12,7 +12,10 @@ const EXIF_TAGS = ['DateTimeOriginal', 'CreateDate', 'ModifyDate']
 
 export async function readMediaMetadata(file) {
   const type = getMediaType(file)
-  const uploadedAt = new Date().toISOString()
+  const modified = new Date(file.lastModified)
+  const uploadedAt = Number.isFinite(modified.getTime()) && file.lastModified > 0
+    ? modified.toISOString()
+    : new Date().toISOString()
   let dateTaken = uploadedAt
   let duration = null
 
@@ -75,18 +78,29 @@ function readVideoDuration(file) {
     const video = document.createElement('video')
     const url = URL.createObjectURL(file)
 
+    const cleanup = () => {
+      clearTimeout(timeout)
+      video.onloadedmetadata = null
+      video.onerror = null
+      video.removeAttribute('src')
+      video.load()
+      URL.revokeObjectURL(url)
+    }
+    const timeout = setTimeout(() => {
+      cleanup()
+      reject(new Error('Video metadata loading timed out. The format may not be supported by this browser.'))
+    }, 15_000)
     video.preload = 'metadata'
     video.muted = true
     video.onloadedmetadata = () => {
       const duration = Number.isFinite(video.duration) ? video.duration : null
-      URL.revokeObjectURL(url)
+      cleanup()
       resolve(duration)
     }
     video.onerror = () => {
-      URL.revokeObjectURL(url)
+      cleanup()
       reject(new Error('Unable to read video metadata'))
     }
     video.src = url
   })
 }
-

@@ -112,13 +112,18 @@ export function useGallery({
         .filter((e) => (e.page_index ?? 0) === pageIndex)
         .map((e) => e.id)
 
-      const pageThumbMap = await loadGalleryPage(pageIndex, entryIds)
+      const { thumbs: pageThumbMap, pageLoaded } = await loadGalleryPage(pageIndex, entryIds)
       if (session !== sessionRef.current) return
 
       if (pageThumbMap.size > 0) {
         setThumbs((prev) => new Map([...prev, ...pageThumbMap]))
       }
-      setLoadedPages((prev) => new Set(prev).add(pageIndex))
+      // Only mark the page as loaded when the fetch genuinely returned data.
+      // A phantom-complete page (0 entries returned but missing ids exist) is
+      // NOT marked loaded — the sentinel stays so scrolling back can retry.
+      if (pageLoaded) {
+        setLoadedPages((prev) => new Set(prev).add(pageIndex))
+      }
     } catch (e) {
       if (session === sessionRef.current) setPageError(e)
       if (import.meta.env.DEV) {

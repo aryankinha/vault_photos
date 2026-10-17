@@ -26,7 +26,10 @@
  * a "Clear cache" toggle in a future settings page.
  */
 import { openDB } from 'idb'
-import { clearOpfsBundle, getOpfsBundle, setOpfsBundle } from '../storage/opfsCache'
+import { clearOpfsBundle, getOpfsBundle, setOpfsBundle } from '../storage/opfsCache.js'
+import { getActiveKey } from '../crypto/keyDerivation.js'
+import { decryptPacked } from '../crypto/decrypt.js'
+import { encryptPacked } from '../crypto/encrypt.js'
 
 const DB_NAME = 'vaultphotos-session'
 // Bump version to 3 — adds the thumbCache store.
@@ -112,23 +115,43 @@ export async function setWorkerUrl(url) {
  * @returns {Promise<ArrayBuffer|Uint8Array|undefined>}
  */
 export async function getBundleCache() {
-  // 1. Try OPFS — fastest path for modern browsers.
-  const opfsData = await getOpfsBundle()
+  const key = getActiveKey()
+  // 1. Try OPFS — fastest path for modern browsers. When a session key exists
+  //    the stored bytes are decrypted (encrypted at rest); legacy plaintext
+  //    fails to decrypt and is treated as a cache miss.
+  const opfsData = await getOpfsBundle(key)
   if (opfsData !== null) return opfsData
 
   // 2. Fall back to IDB.
   const idbData = await (await db()).get(STORE, BUNDLE_KEY)
+  const decoded = idbData ? await decodeCachedBundle(idbData, key) : idbData
 
   // 3. Migrate IDB → OPFS so subsequent loads use the fast path.
   //    Fire-and-forget: migration failure is non-fatal.
-  if (idbData) {
-    void setOpfsBundle(idbData).then((ok) => {
+  if (decoded) {
+    void setOpfsBundle(decoded, key).then((ok) => {
       // Once migrated to OPFS, remove the IDB copy to free space.
       if (ok) return (db()).then((d) => d.delete(STORE, BUNDLE_KEY)).catch(() => {})
     })
   }
 
-  return idbData
+  return decoded
+}
+
+/**
+ * Decrypt IDB-stored bundle bytes when a session key exists. Bytes written by
+ * older versions (plaintext) fail decryption and are returned as-is.
+ */
+async function decodeCachedBundle(bytes, key) {
+  if (!key) return bytes
+  const buffer = bytes instanceof ArrayBuffer
+    ? bytes
+    : bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)
+  try {
+    return await decryptPacked(buffer, key)
+  } catch {
+    return bytes
+  }
 }
 
 /**
@@ -139,13 +162,25 @@ export async function getBundleCache() {
  * @param {ArrayBuffer|Uint8Array} bytes
  */
 export async function setBundleCache(bytes) {
-  const opfsOk = await setOpfsBundle(bytes)
+  const key = getActiveKey()
+  // Encrypt at rest whenever the vault key is available (OPFS path handles
+  // this internally; the IDB fallback needs it explicitly).
+  const opfsOk = await setOpfsBundle(bytes, key)
   if (!opfsOk) {
     // OPFS not available — write to IDB as the only available store.
-    await (await db()).put(STORE, bytes, BUNDLE_KEY)
+    const stored = key
+      ? await encryptPacked(toArrayBuffer(bytes), key)
+      : toArrayBuffer(bytes)
+    await (await db()).put(STORE, stored, BUNDLE_KEY)
   }
   // If OPFS succeeded, skip IDB to avoid double-writing.
   // clearCache() will wipe OPFS so nothing lingers after lock.
+}
+
+function toArrayBuffer(bytes) {
+  return bytes instanceof ArrayBuffer
+    ? bytes
+    : bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +288,30 @@ export async function getThumbCacheStats() {
 // Signatures unchanged.
 // ---------------------------------------------------------------------------
 
+// Mid-session listeners so UI surfaces (pending count, interrupted banner)
+// refresh as soon as queue rows appear/disappear instead of only on batch end.
+const queueChangeListeners = new Set()
+
+/**
+ * Subscribe to upload-queue row changes (enqueue/dequeue/clear).
+ * @param {() => void} listener
+ * @returns {() => void} unsubscribe
+ */
+export function onUploadQueueChanged(listener) {
+  queueChangeListeners.add(listener)
+  return () => queueChangeListeners.delete(listener)
+}
+
+function notifyQueueChanged() {
+  for (const listener of [...queueChangeListeners]) {
+    try {
+      listener()
+    } catch {
+      // A broken listener must not break persistence of queue rows.
+    }
+  }
+}
+
 /**
  * Persist an already-encrypted upload to the queue so a service worker can
  * retry it if the tab closes before the network upload completes.
@@ -261,16 +320,67 @@ export async function getThumbCacheStats() {
  * @param {Uint8Array} encryptedBytes
  * @param {object} entry — manifest entry object (without thumb_offset/thumb_length yet)
  * @param {Blob} [thumbnail] — small recovery copy if the persistent thumb cache is unavailable
+ * @param {string} [sha256] — ciphertext sha256 (X-Vault-SHA256 header)
+ * @param {{ fileHash?: string, cryptoVersion?: 1|2 }} [options] — strong
+ *   PLAINTEXT sha256 of the whole source file (source re-selection), and the
+ *   ciphertext mode used for the retained bytes (2 = context-bound AAD)
  */
-export async function queueUpload(id, encryptedBytes, entry, thumbnail, sha256) {
+export async function queueUpload(id, encryptedBytes, entry, thumbnail, sha256, options = {}) {
   await (await db()).put(QUEUE_STORE, {
     id,
     encryptedBytes,
     entry,
     thumbnail,
     sha256,
+    fileHash: options.fileHash ?? null,
+    // Legacy rows stay legacy: only explicit v2 marks context-bound bytes.
+    cryptoVersion: options.cryptoVersion === 2 ? 2 : undefined,
     backgroundAttempts: 0,
   })
+  notifyQueueChanged()
+}
+
+/**
+ * Persist a chunked upload row BEFORE any chunk upload (U1): a sparse
+ * chunks array makes the row recoverable from the moment it exists, no matter
+ * how many chunks landed before a tab/browser death.
+ *
+ * @param {string} id
+ * @param {object} entry — manifest entry shape incl. chunked/chunk_size/chunk_count
+ * @param {Blob} thumbnail
+ * @param {number} chunkCount
+ * @param {number} chunkSize
+ */
+export async function queueChunkedUploadPending(id, entry, thumbnail, chunkCount, chunkSize, chunkHashes = null, options = {}) {
+  let hashes = chunkHashes
+  let opts = options || {}
+  if (chunkHashes && !Array.isArray(chunkHashes) && typeof chunkHashes === 'object') {
+    opts = chunkHashes
+    hashes = opts.chunkHashes ?? null
+  }
+  const normalizedHashes = Array.isArray(hashes)
+    ? hashes.slice(0, chunkCount).concat(Array.from({ length: Math.max(0, chunkCount - hashes.length) }, () => null))
+    : Array.from({ length: chunkCount }, () => null)
+  const ready = opts.chunkHashesReady ?? (
+    normalizedHashes.length === chunkCount &&
+    normalizedHashes.every((value) => typeof value === 'string' && value.length > 0)
+  )
+  await (await db()).put(QUEUE_STORE, {
+    id,
+    entry,
+    thumbnail,
+    chunked: true,
+    chunk_size: chunkSize,
+    chunk_count: chunkCount,
+    chunks: Array.from({ length: chunkCount }, () => null),
+    chunkHashes: normalizedHashes,
+    chunkHashesReady: Boolean(ready),
+    // Chunk ciphertext mode: 2 = context-bound; absent = legacy. Chunks of a
+    // row are always encrypted in one mode, so resume can never mix them.
+    cryptoVersion: opts.cryptoVersion === 2 ? 2 : undefined,
+    backgroundAttempts: BACKGROUND_ATTEMPT_LIMIT,
+  })
+  notifyQueueChanged()
 }
 
 export async function queueChunkedUpload(id, entry, thumbnail, chunks) {
@@ -282,6 +392,72 @@ export async function queueChunkedUpload(id, entry, thumbnail, chunks) {
     chunks,
     backgroundAttempts: BACKGROUND_ATTEMPT_LIMIT,
   })
+  notifyQueueChanged()
+}
+
+/**
+ * Merge one chunk receipt into a chunked row — atomically: one `readwrite` transaction covering the
+ * get→merge→put, so two in-flight receipts can never race a lost update (U1).
+ *
+ * @param {string} id
+ * @param {number} index — chunk index
+ * @param {{ index: number, sha256: string, size: number }} receipt
+ */
+export async function markChunkUploaded(id, index, receipt) {
+  const database = await db()
+  const tx = database.transaction(QUEUE_STORE, 'readwrite')
+  const row = await tx.store.get(id)
+  if (!row) {
+    // Row was cleared while its chunk was in flight — nothing to update.
+    tx.store.delete(id)
+    await tx.done
+    return
+  }
+  const chunks = Array.from(row.chunks ?? [], (entry) => entry ?? null)
+  chunks[index] = receipt
+  await tx.store.put({ ...row, chunks })
+  await tx.done
+}
+
+/**
+ * Persist the PLAINTEXT sha256 of one chunk before the chunk upload starts,
+ * so source re-selection can be verified strongly for chunk indexes that
+ * never completed (U1). Same single readwrite transaction discipline.
+ *
+ * @param {string} id
+ * @param {number} index
+ * @param {string} hash — plaintext chunk sha256 hex
+ */
+export async function saveChunkPlaintextHash(id, index, hash) {
+  const database = await db()
+  const tx = database.transaction(QUEUE_STORE, 'readwrite')
+  const row = await tx.store.get(id)
+  if (!row) {
+    tx.store.delete(id)
+    await tx.done
+    return
+  }
+  const chunkHashes = Array.from(row.chunkHashes ?? [], (entry) => entry ?? null)
+  chunkHashes[index] = hash
+  await tx.store.put({ ...row, chunkHashes })
+  await tx.done
+}
+
+/**
+ * Persist the receipt of a completed whole-file upload so background sync
+ * does not re-PUT it and the in-RAM copy can be released (U4).
+ * Signature matches the SW's markQueueItemUploaded contract: `uploaded` is
+ * the raw receipt { sha256, size }.
+ *
+ * @param {string} id
+ * @param {object} uploaded — { sha256, size } (parsed upload receipt)
+ */
+export async function markQueuedUploadUploaded(id, uploaded) {
+  const database = await db()
+  const tx = database.transaction(QUEUE_STORE, 'readwrite')
+  const row = await tx.store.get(id)
+  if (row) await tx.store.put({ ...row, uploaded })
+  await tx.done
 }
 
 /**
@@ -290,6 +466,7 @@ export async function queueChunkedUpload(id, entry, thumbnail, chunks) {
  */
 export async function dequeueUpload(id) {
   await (await db()).delete(QUEUE_STORE, id)
+  notifyQueueChanged()
 }
 
 /**
@@ -319,13 +496,8 @@ export async function clearUploadQueue(ids) {
       ids: targets,
     })
   }
-}
 
-export async function markQueuedUploadUploaded(id, uploaded) {
-  const database = await db()
-  const row = await database.get(QUEUE_STORE, id)
-  if (!row) return
-  await database.put(QUEUE_STORE, { ...row, uploaded })
+  notifyQueueChanged()
 }
 
 export async function registerUploadSync() {

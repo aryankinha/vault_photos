@@ -1,0 +1,19 @@
+# Local development configuration for `npm run worker:dev`.
+#
+# Copy this file to `.dev.vars` (gitignored) and fill in HF_TOKEN and HF_REPO
+# with the same values the deployed worker uses.
+#
+# `ENVIRONMENT=development` disables Cloudflare Access verification ONLY for
+# literal loopback request URLs (http://localhost / http://127.0.0.1). Public
+# deployments never get this bypass.
+
+ENVIRONMENT=development
+
+# Browser origins allowed to call this local worker (CORS). Vite serves the app
+# on http://localhost:5173 (and http://127.0.0.1:5173 if opened that way).
+ALLOWED_ORIGIN=http://localhost:5173,http://127.0.0.1:5173
+
+# Hugging Face write token and the Dataset repo backing your vault.
+# These are dev-only local values — `.dev.vars` is never used by `wrangler deploy`.
+HF_TOKEN=
+HF_REPO=your-user/your-dataset
