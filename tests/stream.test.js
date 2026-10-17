@@ -31,6 +31,7 @@ function createContext() {
     URL,
     Response,
     Request,
+    AbortController,
     ReadableStream,
     TextEncoder,
     TextDecoder,
@@ -398,4 +399,28 @@ test('cleanup wakes blocked fetch waiters', async () => {
 
   context.releaseStreamFetchSlot()
   context.releaseStreamFetchSlot()
+})
+
+test('owner-code stream authentication is sent only to the Worker and cleared on cleanup', async () => {
+  const context = createContext()
+  const key = await webcrypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt'])
+  const encrypted = await encryptChunk(Uint8Array.of(42), key, 0)
+  let authorization
+  context.fetch = async (url, options) => {
+    assert.equal(url, 'https://worker.example/get-chunk/0123456789abcdef/0')
+    authorization = options.headers.Authorization
+    return new Response(encrypted)
+  }
+  const session = context.createStreamSession({
+    sessionId: 'a'.repeat(32), key, ownerToken: 'owner-test-code',
+    workerUrl: 'https://worker.example', entry: {
+      id: '0123456789abcdef', size: 1, chunk_size: 8, chunk_count: 1,
+    },
+  }, 'client-1')
+  context.streamSessions.set(session.sessionId, session)
+  assert.deepEqual([...await context.getDecryptedChunk(session, 0)], [42])
+  assert.equal(authorization, 'Bearer owner-test-code')
+  context.cleanupStreamSession(session.sessionId)
+  assert.equal(session.ownerToken, '')
+  assert.equal(session.key, null)
 })

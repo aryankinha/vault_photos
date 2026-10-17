@@ -1,3 +1,4 @@
+import { getOwnerToken } from '../session/connection'
 /**
  * Format-agnostic chunked video streaming.
  *
@@ -125,6 +126,7 @@ async function registerStream(state, controller) {
       credentials: ['include', 'same-origin', 'omit'].includes(import.meta.env.VITE_ACCESS_CREDENTIALS)
         ? import.meta.env.VITE_ACCESS_CREDENTIALS : 'include',
       key: getActiveKey(),
+      ownerToken: getOwnerToken(),
     })
     if (state.cleaned) {
       controller.postMessage({

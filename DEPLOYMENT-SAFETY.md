@@ -5,7 +5,25 @@ Worker before the rebuilt client, and test against a disposable private Dataset
 before trusting it with originals. Keep an independent backup of the repository
 and `salt.bin`. Do not delete originals based only on an upload progress bar.
 
-## Access control
+## Owner-code authentication (current deployment)
+
+The deployed configuration uses `AUTH_MODE=token` so Cloudflare Zero Trust and
+its billing setup are not required. `AUTH_TOKEN_SHA256` is a Worker secret
+containing the SHA-256 digest of a random 256-bit private owner code. Every vault
+read and write requires that code in an Authorization header; the public
+`/auth-mode` endpoint reveals only the selected mode. The origin allowlist still
+applies to writes and credentialed CORS. No HF credentials or owner code are
+included in the frontend build. The owner code is separate from the encryption
+passphrase and is held in document/service-worker RAM only. Background Sync
+is skipped in this mode; interrupted uploads resume explicitly in the app.
+
+Store the owner code in a password manager. Replacing AUTH_TOKEN_SHA256 rotates
+access without changing encryption keys or existing media. The initial code is
+stored locally in `.vault-access-code.local` (ignored by Git, permissions 0600).
+Do not commit or upload that file. Losing this code requires rotating the Worker
+secret; losing the encryption passphrase still makes vault content unrecoverable.
+
+## Cloudflare Access alternative
 
 Configure the Worker's allowed frontend origin explicitly. An origin allowlist
 blocks cross-site browser requests; **it does not authenticate curl or other
@@ -23,7 +41,7 @@ challenge preflight requests — verify this in staging (the Worker itself answe
 domains. Access setup and rate-limit policy are deployment tasks; changing
 source code alone does not install those controls on an existing deployment.
 
-Production requests fail closed unless `ACCESS_TEAM_DOMAIN` (the exact
+When using `AUTH_MODE=access`, production requests fail closed unless `ACCESS_TEAM_DOMAIN` (the exact
 `https://<team>.cloudflareaccess.com` origin) and `ACCESS_AUD` (the Access
 application audience) are configured. `ACCESS_EMAILS` optionally restricts
 identities further. The Worker validates the signature and claims itself; merely

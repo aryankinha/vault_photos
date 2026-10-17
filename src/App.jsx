@@ -4,6 +4,7 @@ import { Unlock } from './pages/Unlock'
 import { Gallery } from './pages/Gallery'
 import { Viewer } from './pages/Viewer'
 import { Upload } from './pages/Upload'
+import { ConnectionGate } from './components/ConnectionGate'
 import { UploadProvider } from './context/UploadContext'
 import { PersistentUploadBar } from './components/PersistentUploadBar'
 
@@ -22,6 +23,7 @@ function RequireUnlock({ children }) {
 
 export default function App() {
   return (
+    <ConnectionGate>
     <UploadProvider>
       <BrowserRouter>
         <Routes>
@@ -57,5 +59,6 @@ export default function App() {
         <PersistentUploadBar />
       </BrowserRouter>
     </UploadProvider>
+    </ConnectionGate>
   )
 }

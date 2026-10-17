@@ -2,6 +2,7 @@ import { uploadMediaBatch } from '../../src/services/uploadService.js'
 import { unlockWithPassphrase, clearActiveKey } from '../../src/crypto/keyDerivation.js'
 import { encryptPacked } from '../../src/crypto/encrypt.js'
 import { decryptPacked } from '../../src/crypto/decrypt.js'
+import { loadManifest } from '../../src/storage/manifest.js'
 import { encodeManifest, parseManifestBytes } from '../../src/storage/manifestCodec.js'
 import { createEmptyManifest } from '../../src/schema/manifestSchema.js'
 import { createEmptyBundle } from '../../src/schema/bundleSchema.js'
@@ -41,21 +42,27 @@ window.runUploadIntegration = async () => {
   const OriginalXHR = window.XMLHttpRequest
   const before = new Set((await getUploadQueue()).map((row) => row.id))
   const ids = new Set()
-  const key = await unlockWithPassphrase('integration test only passphrase', new Uint8Array(16))
+  const key = await unlockWithPassphrase('integration test only passphrase', crypto.getRandomValues(new Uint8Array(16)))
   const manifest = createEmptyManifest()
   manifest.bundle_pages = 1
-  const manifestBytes = await encryptPacked(await encodeManifest(manifest), key)
-  const pageBytes = await encryptPacked(createEmptyBundle(), key)
+  let manifestBytes = await encryptPacked(await encodeManifest(manifest), key)
+  let pageBytes = await encryptPacked(createEmptyBundle(), key)
   const commits = []
-  const oid = 'a'.repeat(40)
+  let oid = 'a'.repeat(40)
   window.fetch = async (input, options = {}) => {
     const url = new URL(String(input), location.origin)
     if (url.pathname === '/vault-head') return Response.json({ oid })
     if (url.pathname === '/get-manifest') return new Response(manifestBytes.slice(0))
     if (url.pathname === '/get-bundle-page/0') return new Response(pageBytes.slice(0))
     if (url.pathname === '/commit-batch') {
-      commits.push(JSON.parse(options.body))
-      return Response.json({ ok: true, oid: 'b'.repeat(40) })
+      const payload = JSON.parse(options.body)
+      if (payload.parentCommit !== oid) throw new Error('Stale publication')
+      commits.push(payload)
+      manifestBytes = base64ToBytes(payload.manifestBytesBase64).buffer
+      const page = payload.bundlePages?.find((item) => item.pageIndex === 0)
+      if (page) pageBytes = base64ToBytes(page.bytesBase64).buffer
+      oid = (commits.length === 1 ? 'b' : 'c').repeat(40)
+      return Response.json({ ok: true, commitOid: oid })
     }
     throw new Error(`Unexpected test fetch ${url.pathname}`)
   }
@@ -100,9 +107,16 @@ window.runUploadIntegration = async () => {
     if (videoResult.errors.length) throw videoResult.errors[0].error
     if (videoResult.entries.length !== 1) throw new Error('Expected one committed video entry')
 
+    const latestManifest = manifestBytes
+    manifestBytes = base64ToBytes(commits[0].manifestBytesBase64).buffer
+    let rollbackRejected = false
+    try { await loadManifest(oid) } catch (error) { rollbackRejected = error.code === 'VAULT_ROLLBACK' }
+    finally { manifestBytes = latestManifest }
+    if (!rollbackRejected) throw new Error('A returning session accepted an older manifest')
+
     if (commits.length !== 2) throw new Error(`Expected two publications, got ${commits.length}`)
-    for (const commit of commits) {
-      if (commit.parentCommit !== oid) throw new Error('Publication was not CAS protected')
+    if (commits[0].parentCommit !== 'a'.repeat(40) || commits[1].parentCommit !== 'b'.repeat(40)) {
+      throw new Error('Publication was not CAS protected')
     }
 
     const photoManifest = await parseManifestBytes(new Uint8Array(
@@ -117,6 +131,7 @@ window.runUploadIntegration = async () => {
       await decryptPacked(base64ToBytes(commits[1].manifestBytesBase64), key),
     ))
     const videoEntry = videoManifest.files.find((entry) => entry.name === 'integration.webm')
+    if (videoManifest.files.length !== 2 || videoManifest.revision !== 2) throw new Error('Sequential uploads must preserve both entries and advance revisions')
     if (!videoEntry) throw new Error('Video entry missing from published manifest')
     if (videoEntry.crypto_version !== 2 || videoEntry.chunked !== true) {
       throw new Error('Video entry is not a context-bound chunked entry')
@@ -132,6 +147,7 @@ window.runUploadIntegration = async () => {
     if (remaining.length) throw new Error('Successful uploads left recovery rows')
     return {
       passed: true,
+      rollbackRejected,
       commits: commits.length,
       photo: { cryptoVersion: photoEntry.crypto_version, sha256: photoEntry.sha256.slice(0, 12) },
       video: { cryptoVersion: videoEntry.crypto_version, chunks: videoEntry.chunk_count },
@@ -147,4 +163,9 @@ window.runUploadIntegration = async () => {
     clearActiveKey()
     shutdownPool()
   }
+}
+
+if (location.search.includes('autorun')) {
+  window.runUploadIntegration().then((result) => { document.querySelector('#result').textContent = JSON.stringify(result, null, 2) })
+    .catch((error) => { document.querySelector('#result').textContent = JSON.stringify({ passed: false, error: error.message }) })
 }

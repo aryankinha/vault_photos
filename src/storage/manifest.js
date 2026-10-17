@@ -1,3 +1,4 @@
+import { checkManifestRevision } from '../session/revision.js'
 /**
  * Manifest storage. Handles fetch → decrypt → parse and serialize → encrypt →
  * upload round-trips against the worker. First-run creation is handled by the
@@ -34,7 +35,9 @@ import * as worker from './workerClient'
 export async function loadManifest(revision) {
   const buffer = await worker.getManifest(revision)
   const decrypted = await decryptPacked(buffer, getActiveKey())
-  return parseManifestBytes(decrypted)
+  const manifest = await parseManifestBytes(decrypted)
+  await checkManifestRevision(manifest)
+  return manifest
 }
 
 export async function saveManifest(manifest) {

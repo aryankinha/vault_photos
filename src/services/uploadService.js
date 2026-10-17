@@ -1,3 +1,4 @@
+import { checkManifestRevision } from '../session/revision.js'
 /**
  * Client-side media upload pipeline.
  *
@@ -925,6 +926,7 @@ async function finalizeUploads(succeeded, uploadResults, allProcessed, signal) {
           }
 
           manifest.files.push(...entries)
+          manifest.revision = (manifest.revision || 0) + 1
           manifest.updated_at = new Date().toISOString()
           const compressedManifest = await serializeManifestCompressed(manifest)
           const encryptedManifest = new Uint8Array(
@@ -942,6 +944,7 @@ async function finalizeUploads(succeeded, uploadResults, allProcessed, signal) {
 
           try {
             await worker.commitBatch(payload, { signal })
+            await checkManifestRevision(manifest)
             allEntries.push(...entries)
             await clearCache().catch(() => {})
             break

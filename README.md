@@ -3,7 +3,7 @@
 > Before deploying the hardening changes, read [Deployment safety](DEPLOYMENT-SAFETY.md).
 > The client and Worker now use revision-pinned reads and conflict-checked
 > publication. Configure `ALLOWED_ORIGIN` for your frontend and protect the
-> Worker with identity-based access control; an origin allowlist is not authentication.
+> Worker with owner-code or Cloudflare Access authentication; an origin allowlist is not authentication.
 
 Privacy-first encrypted photo and video storage. Photos and videos are
 encrypted **on the client** before being uploaded to a Hugging Face Dataset
@@ -66,6 +66,14 @@ Cloudflare Worker · Hugging Face Dataset · Vercel.
    encrypted). Create one at `https://huggingface.co/new-dataset`. Note its
    `username/reponame` id.
 3. The **Cloudflare Worker** must be deployed with `HF_TOKEN` and `HF_REPO`.
+
+## Current production authentication
+
+This deployment uses a private owner access code checked by the Worker, without
+Cloudflare Zero Trust. The app first asks for that access code, then asks for the
+existing vault encryption passphrase. The Worker stores only `AUTH_TOKEN_SHA256`;
+never put the code or HF token in frontend environment variables. Read
+[Deployment safety](DEPLOYMENT-SAFETY.md) for setup and recovery details.
 
 ## Setup
 

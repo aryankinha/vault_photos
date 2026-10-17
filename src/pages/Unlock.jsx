@@ -1,3 +1,4 @@
+import { checkManifestRevision } from '../session/revision.js'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { ShieldCheck, Loader2, AlertTriangle } from 'lucide-react'
@@ -104,7 +105,7 @@ export function Unlock() {
         } catch {
           throw new WrongPassphraseError()
         }
-        await parseManifestBytes(decrypted)
+        await checkManifestRevision(await parseManifestBytes(decrypted))
         navigate('/gallery', { replace: true })
       } catch (e) {
         clearActiveKey()

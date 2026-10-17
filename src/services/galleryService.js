@@ -1,3 +1,4 @@
+import { checkManifestRevision } from '../session/revision.js'
 /**
  * Gallery orchestration: load manifest + bundle, decrypt, sort by date taken,
  * and hand back entries paired with their thumbnail blobs. Uses the session
@@ -331,7 +332,9 @@ async function loadManifestWithCache() {
   const cached = await getManifestCache()
   if (cached) {
     try {
-      return parseJsonManifest(cached)
+      const manifest = parseJsonManifest(cached)
+      await checkManifestRevision(manifest)
+      return manifest
     } catch {
       // Stale/corrupt cache — fall through to network.
     }

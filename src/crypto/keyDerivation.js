@@ -1,3 +1,4 @@
+import { setRevisionScope, clearRevisionScope } from '../session/revision.js'
 // Use the pre-bundled build which inlines the WASM as base64. The default
 // `argon2-browser` entry does `require('../dist/argon2.wasm')`, which Vite
 // cannot resolve at build time. The bundled build sidesteps that entirely.
@@ -40,6 +41,7 @@ export async function deriveKeyFromPassphrase(passphrase, salt) {
 }
 
 export async function unlockWithPassphrase(passphrase, salt) {
+  await setRevisionScope(import.meta.env?.VITE_WORKER_URL || 'local', salt)
   activeKey = await deriveKeyFromPassphrase(passphrase, salt)
   return activeKey
 }
@@ -58,6 +60,7 @@ export function hasActiveKey() {
 
 export function clearActiveKey() {
   activeKey = null
+  clearRevisionScope()
   if (typeof navigator !== 'undefined') {
     navigator.serviceWorker?.controller?.postMessage({ type: 'vault-stream-clear' })
   }

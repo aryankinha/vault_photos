@@ -2,6 +2,7 @@ import {
   planAtomicCommitBatches,
   MAX_HF_OPERATIONS_PER_COMMIT,
 } from './commitPlan.js'
+import { verifyOwnerToken } from '../security/token.js'
 import { verifyAccess, AccessAuthError } from '../security/access.js'
 
 /**
@@ -51,7 +52,7 @@ import { verifyAccess, AccessAuthError } from '../security/access.js'
 const HF_API = 'https://huggingface.co'
 
 const ALLOWED_METHODS = 'GET, POST, OPTIONS'
-const ALLOWED_HEADERS = 'Content-Type, X-Vault-SHA256, X-Vault-Size'
+const ALLOWED_HEADERS = 'Content-Type, Authorization, X-Vault-SHA256, X-Vault-Size'
 const CORS_MAX_AGE = '86400'
 
 // files/** are stored via LFS so large videos don't bloat the git repo.
@@ -119,6 +120,10 @@ export default {
 
     const finalize = (response) => applyCors(response, originAllowed ? origin : null, url.pathname)
 
+    if (url.pathname === '/auth-mode' && request.method === 'GET') {
+      return finalize(json({ mode: env.AUTH_MODE === 'token' ? 'token' : 'access' }, 200))
+    }
+
     if (!env.HF_TOKEN || !env.HF_REPO) {
       return finalize(json({ error: 'Worker misconfigured: HF_TOKEN and HF_REPO must be set' }, 500))
     }
@@ -143,7 +148,15 @@ export default {
       // dashboard gateway. The exception is explicit, loopback-only local dev.
       const localDevelopment = env.ENVIRONMENT === 'development' &&
         url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)
-      if (!localDevelopment) await verifyAccess(request, env)
+      if (!localDevelopment) {
+        if (env.AUTH_MODE === 'token') {
+          if (!await verifyOwnerToken(request, env)) {
+            return finalize(json({ error: 'A valid private access code is required', code: 'AUTH_REQUIRED', retryable: false }, 401))
+          }
+        } else {
+          await verifyAccess(request, env)
+        }
+      }
       const handler = route(url.pathname, request.method)
       if (!handler) return finalize(json({ error: 'Not found' }, 404))
 

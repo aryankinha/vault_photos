@@ -1,3 +1,4 @@
+import { connectionHeaders } from '../session/connection'
 /**
  * Thin fetch/XHR wrapper for the Cloudflare Worker. This is the only module in
  * the app that knows how to talk to the network — no HF URLs live anywhere else.
@@ -265,6 +266,7 @@ function buildPath(path, { revision } = {}) {
 
 async function getBytes(path, options = {}) {
   const res = await fetch(`${WORKER_URL}${buildPath(path, options)}`, {
+    headers: connectionHeaders(),
     credentials: ACCESS_CREDENTIALS,
     signal: options.signal,
   })
@@ -274,6 +276,7 @@ async function getBytes(path, options = {}) {
 
 async function getJson(path, options = {}) {
   const res = await fetch(`${WORKER_URL}${path}`, {
+    headers: connectionHeaders(),
     credentials: ACCESS_CREDENTIALS,
     signal: options.signal,
   })
@@ -299,6 +302,7 @@ function xhrPost(path, bytes, onProgress, options = {}) {
     xhr.open('POST', `${WORKER_URL}${path}`)
     xhr.timeout = 30 * 60 * 1000
     if (ACCESS_CREDENTIALS === 'include') xhr.withCredentials = true
+    for (const [name, value] of Object.entries(connectionHeaders())) xhr.setRequestHeader(name, value)
     xhr.setRequestHeader('Content-Type', 'application/octet-stream')
     xhr.setRequestHeader('X-Vault-Size', String(body.byteLength))
     if (sha256) xhr.setRequestHeader('X-Vault-SHA256', sha256)
@@ -380,7 +384,7 @@ function xhrPost(path, bytes, onProgress, options = {}) {
 async function postJson(path, payload, options = {}) {
   const res = await fetch(`${WORKER_URL}${path}`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...connectionHeaders() },
     credentials: ACCESS_CREDENTIALS,
     body: JSON.stringify(payload),
     signal: options.signal,

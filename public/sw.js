@@ -166,6 +166,12 @@ self.addEventListener('fetch', (event) => {
 async function processUploadQueue() {
   const workerUrl = await getWorkerUrl()
   if (!workerUrl) return
+  // Owner codes are deliberately never persisted in IDB. Recovery in token
+  // mode therefore runs explicitly in the foreground after connecting.
+  try {
+    const mode = await fetch(`${workerUrl}/auth-mode`, { credentials: 'include' }).then((response) => response.json())
+    if (mode.mode === 'token') return
+  } catch { return }
 
   const database = await openDB()
   const items = await getAllQueueItems(database)
@@ -240,6 +246,7 @@ function createStreamSession(message, clientId) {
     entry,
     key,
     workerUrl: workerUrl.replace(/\/$/, ''),
+    ownerToken: typeof message.ownerToken === 'string' ? message.ownerToken : '',
     credentials: ['include', 'same-origin', 'omit'].includes(message.credentials) ? message.credentials : 'include',
     mimeType: mimeType || 'video/mp4',
     clientId: owner,
@@ -346,7 +353,8 @@ async function getDecryptedChunk(session, index) {
     try {
       const response = await fetch(
         `${session.workerUrl}/get-chunk/${session.entry.id}/${index}`,
-        { signal: session.controller.signal, credentials: session.credentials || 'include' },
+        { signal: session.controller.signal, credentials: session.credentials || 'include',
+          headers: session.ownerToken ? { Authorization: `Bearer ${session.ownerToken}` } : {} },
       )
       if (!response.ok) throw new Error(`Chunk request failed (${response.status})`)
       const expectedSize = Math.min(session.entry.chunk_size, session.entry.size - index * session.entry.chunk_size)
@@ -537,6 +545,7 @@ function cleanupStreamSession(sessionId) {
   session.cache.clear()
   session.pending.clear()
   session.key = null
+  session.ownerToken = ''
   streamSessions.delete(sessionId)
 }
 

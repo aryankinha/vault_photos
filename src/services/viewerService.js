@@ -32,7 +32,7 @@ import {
   setCachedFile,
 } from '../storage/opfsCache'
 
-export async function loadFullMedia(entryOrId, mimeType) {
+export async function loadFullMedia(entryOrId, mimeType, options = {}) {
   let entry
   if (typeof entryOrId === 'object' && entryOrId !== null) {
     entry = entryOrId
@@ -48,7 +48,8 @@ export async function loadFullMedia(entryOrId, mimeType) {
   const contextBound = cryptoVersion === CRYPTO_VERSION_CONTEXT
   // The context is only bound for context-mode objects; legacy entries keep
   // the exact pre-existing (no-AAD) decrypt.
-  const context = entry && contextBound ? fileContext(id) : undefined
+  const context = entry && contextBound
+    ? (entry.chunked ? { kind: 'chunk', id } : fileContext(id)) : undefined
 
   if (entry && entry.chunked) {
     // ── Chunked assembly path (Phase 7) ────────────────────────────────────
@@ -61,7 +62,7 @@ export async function loadFullMedia(entryOrId, mimeType) {
       entry.id,
       entry.chunk_count,
       getActiveKey(),
-      worker.getChunk,
+      (mediaId, index) => worker.getChunk(mediaId, index, options),
       undefined,
       { context, cryptoVersion, chunkSha256: entry.chunk_sha256 },
     )) {
@@ -80,6 +81,8 @@ export async function loadFullMedia(entryOrId, mimeType) {
   if (!contextBound && await isOPFSSupported()) {
     try {
       const cached = await getCachedFile(id, getActiveKey())
+      if (!cached) throw new Error('Cache miss')
+      options.signal?.throwIfAborted()
       const blob = new Blob([cached], { type: mimeType || 'application/octet-stream' })
       return URL.createObjectURL(blob)
     } catch {
@@ -89,7 +92,7 @@ export async function loadFullMedia(entryOrId, mimeType) {
   }
 
   // ── Cold path: fetch, verify integrity, then decrypt from worker ────────
-  const buffer = await worker.getFile(id)
+  const buffer = await worker.getFile(id, options)
   // Verify the ciphertext hash (when the manifest recorded one) BEFORE
   // decrypting, so swaps/truncation surface as a clear integrity error.
   await assertCiphertextHash(buffer, entry?.sha256, `file ${id}`)
@@ -98,6 +101,7 @@ export async function loadFullMedia(entryOrId, mimeType) {
   // Persist ciphertext only. The plaintext remains in memory for this view.
   if (await isOPFSSupported()) void setCachedFile(id, buffer)
 
+  options.signal?.throwIfAborted()
   const blob = new Blob([decrypted], { type: mimeType || 'application/octet-stream' })
   return URL.createObjectURL(blob)
 }
