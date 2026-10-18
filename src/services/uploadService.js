@@ -499,9 +499,9 @@ async function processFile(file, report, optimisticCallbacks, signal) {
     throwIfAborted(signal)
     report({ currentFile: file.name, stage: 'reading' })
 
-    const metadata = await readMediaMetadata(file)
+    const metadata = await readMediaMetadata(file, { signal })
     throwIfAborted(signal)
-    const thumbnail = await generateThumbnail(file, metadata.type)
+    const thumbnail = await generateThumbnail(file, metadata.type, { signal })
     const thumbBytes = new Uint8Array(await thumbnail.arrayBuffer())
     const isChunked = metadata.type === 'video' || file.size >= CHUNK_THRESHOLD
     // New uploads are context-bound (S3): AES-GCM AAD includes kind+id+index

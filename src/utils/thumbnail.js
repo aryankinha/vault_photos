@@ -1,3 +1,5 @@
+import { createAbortError, throwIfAborted } from './abort.js'
+
 const MAX_DIMENSION = 400
 const JPEG_QUALITY = 0.7
 // Small probe decode: cheap for engines with decode-to-scale (Blink), and
@@ -14,9 +16,10 @@ const PROBE_DIMENSION = 8
  * @param {'image'|'video'} type
  * @returns {Promise<Blob>} — re-encoded JPEG (EXIF/GPS stripped by re-encode)
  */
-export async function generateThumbnail(file, type) {
+export async function generateThumbnail(file, type, { signal } = {}) {
+  throwIfAborted(signal)
   if (type === 'image') return generateImageThumbnail(file)
-  if (type === 'video') return generateVideoThumbnail(file)
+  if (type === 'video') return generateVideoThumbnail(file, signal)
   throw new Error('Unsupported media type for thumbnail')
 }
 
@@ -99,38 +102,73 @@ function drawScaled(sourceWidth, sourceHeight, draw) {
   return canvas
 }
 
-function generateVideoThumbnail(file) {
+function generateVideoThumbnail(file, signal) {
   return new Promise((resolve, reject) => {
     const video = document.createElement('video')
     const url = URL.createObjectURL(file)
+    let settled = false
+    let capturing = false
+    let target = 0
+
+    const cleanup = () => {
+      clearTimeout(timeout)
+      signal?.removeEventListener('abort', onAbort)
+      video.onloadedmetadata = video.onloadeddata = video.onseeked = video.onerror = null
+      video.pause()
+      video.removeAttribute('src')
+      video.load()
+      URL.revokeObjectURL(url)
+    }
+    const finish = (error, blob) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      if (error) reject(error)
+      else resolve(blob)
+    }
+    const onAbort = () => finish(createAbortError())
+    const timeout = setTimeout(() => finish(new Error(
+      'Video preview timed out. This browser may not support the video codec.',
+    )), 15_000)
 
     video.muted = true
     video.playsInline = true
     video.preload = 'metadata'
 
     video.onloadedmetadata = () => {
-      const target = Math.min(1, Math.max(0, video.duration / 2 || 0))
-      video.currentTime = target
+      // Unknown/infinite durations (common in recorded WebM) use frame zero.
+      // Seeking to the current time is not guaranteed to emit `seeked`.
+      target = Number.isFinite(video.duration) && video.duration > 0
+        ? Math.min(1, video.duration / 2)
+        : 0
+      if (target > 0) video.currentTime = target
+      else if (video.readyState >= 2) void capture()
     }
 
-    video.onseeked = async () => {
+    const capture = async () => {
+      if (settled || capturing) return
+      capturing = true
       try {
+        if (!video.videoWidth || !video.videoHeight) throw new Error('Video has no decodable frame')
         const blob = await canvasToJpeg(drawScaled(video.videoWidth, video.videoHeight, (ctx, width, height) => {
           ctx.drawImage(video, 0, 0, width, height)
         }))
-        URL.revokeObjectURL(url)
-        resolve(blob)
+        finish(null, blob)
       } catch (error) {
-        URL.revokeObjectURL(url)
-        reject(error)
+        finish(error)
       }
+    }
+    video.onseeked = capture
+    video.onloadeddata = () => {
+      if (target === 0) void capture()
     }
 
     video.onerror = () => {
-      URL.revokeObjectURL(url)
-      reject(new Error('Unable to generate video thumbnail'))
+      finish(new Error('Unable to generate video preview. This browser may not support the video codec.'))
     }
 
+    signal?.addEventListener('abort', onAbort, { once: true })
+    if (signal?.aborted) { onAbort(); return }
     video.src = url
   })
 }

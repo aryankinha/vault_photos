@@ -1,4 +1,5 @@
 import exifr from 'exifr'
+import { createAbortError, throwIfAborted } from './abort.js'
 
 /**
  * Maximum bytes read from a file for EXIF extraction.
@@ -10,7 +11,8 @@ const EXIF_HEADER_SIZE = 64 * 1024
 
 const EXIF_TAGS = ['DateTimeOriginal', 'CreateDate', 'ModifyDate']
 
-export async function readMediaMetadata(file) {
+export async function readMediaMetadata(file, { signal } = {}) {
+  throwIfAborted(signal)
   const type = getMediaType(file)
   const modified = new Date(file.lastModified)
   const uploadedAt = Number.isFinite(modified.getTime()) && file.lastModified > 0
@@ -24,7 +26,7 @@ export async function readMediaMetadata(file) {
   }
 
   if (type === 'video') {
-    duration = await readVideoDuration(file)
+    duration = await readVideoDuration(file, signal)
   }
 
   return { type, date_taken: dateTaken, duration }
@@ -73,19 +75,21 @@ function getMediaType(file) {
   throw new Error('Only image and video files are supported')
 }
 
-function readVideoDuration(file) {
+function readVideoDuration(file, signal) {
   return new Promise((resolve, reject) => {
     const video = document.createElement('video')
     const url = URL.createObjectURL(file)
 
     const cleanup = () => {
       clearTimeout(timeout)
+      signal?.removeEventListener('abort', onAbort)
       video.onloadedmetadata = null
       video.onerror = null
       video.removeAttribute('src')
       video.load()
       URL.revokeObjectURL(url)
     }
+    const onAbort = () => { cleanup(); reject(createAbortError()) }
     const timeout = setTimeout(() => {
       cleanup()
       reject(new Error('Video metadata loading timed out. The format may not be supported by this browser.'))
@@ -101,6 +105,8 @@ function readVideoDuration(file) {
       cleanup()
       reject(new Error('Unable to read video metadata'))
     }
+    signal?.addEventListener('abort', onAbort, { once: true })
+    if (signal?.aborted) { onAbort(); return }
     video.src = url
   })
 }
