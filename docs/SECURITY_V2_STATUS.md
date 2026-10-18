@@ -15,7 +15,17 @@ has been created or deployed. The old HF dataset is unchanged.
 
 Phase 1 crypto core is implemented: **215 tests pass**, lint/build pass, and
 the Brave module-worker harness passes for all five purpose keys. See
-[CRYPTO_V2_CORE.md](CRYPTO_V2_CORE.md). Phase 2 lifecycle integration is next.
+[CRYPTO_V2_CORE.md](CRYPTO_V2_CORE.md).
+
+Phase 2's lifecycle services and screens are implemented behind a storage adapter.
+**222 tests pass**, lint/build pass. The isolated Brave walkthrough passed
+creation/save confirmation, device-key unlock, generic wrong-passphrase failure,
+passphrase change, SK rotation, recovery with fresh SK/RK, rejection of old RK,
+and an actual one-minute configured idle lock (then restored to five minutes).
+Storage and downloads were test doubles in RAM. Key-file parsing/import logic
+is tested in Node; the browser's OS file-picker path is still unverified.
+The legacy main app has not yet been switched over. Phase 3 must connect this
+adapter to v2 storage and remove the old crypto/route paths before deployment.
 
 Owner clarification: changes to the passphrase or Secret Key require the Recovery
 Key so both wraps can authenticate the new shared generation and KDF settings.

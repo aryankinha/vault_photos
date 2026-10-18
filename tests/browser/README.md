@@ -27,3 +27,13 @@ The UI harness's fake auth-mode response does not test Cloudflare Access.
 Worker authentication and HF protocol behavior have separate Node tests.
 Browser checks must be recorded with their actual platform and limitations in
 `docs/BUGS.md`; passing these doubles is not a live HF upload or Android result.
+
+V2 checks:
+
+- `/tests/browser/cryptoV2Harness.html` runs actual one-shot Argon2 and media
+  workers, all five purpose keys, normal/recovery unlock and UI heartbeat checks.
+- `/tests/browser/lifecycleV2Harness.html` renders the new lifecycle screens
+  with encrypted test storage and simulated downloads in RAM. Walk create,
+  save/confirm, lock/unlock, security settings, rotation and recovery here.
+  The fake adapter is not the production API; actual OS file operations are not
+  established by a simulated-download result. Do not use real credentials.
