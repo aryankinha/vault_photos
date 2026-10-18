@@ -3,6 +3,8 @@
  * A transferred ArrayBuffer is detached in the sender immediately, so tasks
  * are never retried with the same buffer after dispatch.
  */
+import { encodeObjectContext } from '../crypto/v2/objects.js'
+import { terminateKeyDerivations } from '../crypto/v2/argon2.js'
 
 const POOL_SIZE = Math.min(
   typeof navigator === 'undefined' ? 1 : (navigator.hardwareConcurrency || 4),
@@ -112,6 +114,21 @@ export function isCryptoPoolSupported() {
   return typeof Worker !== 'undefined'
 }
 
+/** V2 dispatch selects only the context's purpose key; no master key crosses. */
+export function encryptV2WithPool(buffer, purposeKeys, context) {
+  encodeObjectContext(context)
+  const key = purposeKeys[context.kind]
+  if (key?.algorithm?.name !== 'AES-GCM' || key.extractable !== false) throw new Error('Invalid purpose key')
+  return dispatch(context.kind === 'chunk' ? 'encryptV2Chunk' : 'encryptV2', buffer, key, { context })
+}
+
+export function decryptV2WithPool(buffer, purposeKeys, context) {
+  encodeObjectContext(context)
+  const key = purposeKeys[context.kind]
+  if (key?.algorithm?.name !== 'AES-GCM' || key.extractable !== false) throw new Error('Invalid purpose key')
+  return dispatch(context.kind === 'chunk' ? 'decryptV2Chunk' : 'decryptV2', buffer, key, { context })
+}
+
 /**
  * @param {ArrayBuffer|Uint8Array} buffer
  * @param {CryptoKey} key
@@ -159,6 +176,7 @@ export function exifWithPool(buffer) {
 }
 
 export function shutdownPool() {
+  terminateKeyDerivations()
   terminated = true
   const error = new Error('Crypto worker pool terminated')
 

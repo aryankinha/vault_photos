@@ -7,9 +7,15 @@ Work is on `security-v2`, starting from `86a7deb`. Initial verification:
 uncommitted `report.md` is preserved; it will be regenerated in the documentation
 phase, rather than presented as a verified description of the new format.
 
-Phase 0 is in progress. See [BUGS.md](BUGS.md) for symptoms, confirmed defects,
-individual fixes, and the uncompleted physical-device checks. No v2 vault has
-been created or deployed. The old HF dataset has not been changed by this work.
+Phase 0's confirmed upload fixes are committed individually and pushed. See
+[BUGS.md](BUGS.md) for verified coverage and remaining walkthrough gaps. The
+owner explicitly deferred Android testing to future work and asked implementation
+to continue. Synthetic v2 vaults exist only in isolated tests; no real v2 vault
+has been created or deployed. The old HF dataset is unchanged.
+
+Phase 1 crypto core is implemented: **215 tests pass**, lint/build pass, and
+the Brave module-worker harness passes for all five purpose keys. See
+[CRYPTO_V2_CORE.md](CRYPTO_V2_CORE.md). Phase 2 lifecycle integration is next.
 
 Owner clarification: changes to the passphrase or Secret Key require the Recovery
 Key so both wraps can authenticate the new shared generation and KDF settings.
@@ -36,8 +42,9 @@ Key so both wraps can authenticate the new shared generation and KDF settings.
 
 ## Remaining acceptance gates
 
-The upgrade is not complete. Phase 1–7 implementation, a fresh public HF dataset,
-same-origin deployment, real Worker CPU measurements, Android browser tests and
-Argon2 benchmark, backup/restore, destructive purge verification on a disposable
+The upgrade is not complete. Phase 2–7 implementation, a fresh public HF dataset,
+same-origin deployment, real Worker CPU measurements, backup/restore,
+destructive purge verification on a disposable
 repo, and final free security scans all remain. Do not replace these results
-with a local unit-test result or claim an independent security review.
+with a local unit-test result or claim an independent security review. Android
+browser testing and the phone benchmark are explicitly deferred by the owner.

@@ -10,6 +10,7 @@
 
 import exifr from 'exifr'
 import { encodeCryptoContext } from '../crypto/context.js'
+import { encryptObject, decryptObject, encryptObjectChunk, decryptObjectChunk } from '../crypto/v2/objects.js'
 
 const NONCE_BYTES = 12
 const INDEX_BYTES = 4
@@ -24,7 +25,15 @@ self.onmessage = async (event) => {
   try {
     let result
 
-    if (operation === 'encrypt') {
+    if (operation === 'encryptV2') {
+      result = await encryptObject(buffer, key, context)
+    } else if (operation === 'decryptV2') {
+      result = await decryptObject(buffer, key, context)
+    } else if (operation === 'encryptV2Chunk') {
+      result = await encryptObjectChunk(buffer, key, context)
+    } else if (operation === 'decryptV2Chunk') {
+      result = await decryptObjectChunk(buffer, key, context)
+    } else if (operation === 'encrypt') {
       result = await encryptPacked(buffer, key, context)
     } else if (operation === 'decrypt') {
       result = await decryptPacked(buffer, key, context)
