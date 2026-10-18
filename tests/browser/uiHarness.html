@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Isolated VaultPhotos UI check</title><link rel="icon" href="/favicon.svg"></head>
+  <body>
+    <aside style="position:relative;z-index:100;background:#fff;color:#111;padding:8px">
+      TEST STORAGE ONLY — no requests go to Cloudflare or Hugging Face.
+      <label><input id="pause-uploads" type="checkbox"> Pause test upload responses</label>
+      <button id="insert-photo">Insert synthetic photo</button>
+      <button id="insert-mixed">Insert synthetic photo + 160 MiB MP4</button>
+    </aside>
+    <div id="root"></div>
+    <pre id="test-requests"></pre>
+    <script type="module" src="./uiHarness.jsx"></script>
+  </body>
+</html>
