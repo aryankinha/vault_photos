@@ -25,6 +25,7 @@ export function Upload() {
   const inputRef = useRef(null)
   const [started, setStarted] = useState(false)
   const [fileCount, setFileCount] = useState(0)
+  const [selectionError, setSelectionError] = useState('')
   const { startBatch, isUploading, cancelBatch } = useUploadContext()
 
   // Drag-drop state
@@ -56,11 +57,16 @@ export function Upload() {
     }
     if (accepted.length === 0) return
 
+    setSelectionError('')
     setFileCount((prev) => prev + accepted.length)
     setStarted(true)
 
     // Hand off to context — this returns immediately; upload runs in background.
-    startBatch(accepted)
+    void startBatch(accepted).catch((error) => {
+      setSelectionError(error.message || 'Unable to queue these files. Please select them again.')
+      setFileCount((previous) => Math.max(0, previous - accepted.length))
+      setStarted(false)
+    })
   }, [filterFiles, startBatch])
 
   // ── Clipboard paste ──────────────────────────────────────────────────────
@@ -119,6 +125,12 @@ export function Upload() {
     >
       <Topbar title="Upload" />
       <main className="mx-auto max-w-2xl px-4 py-6">
+
+        {selectionError && (
+          <p role="alert" className="mb-4 rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+            {selectionError}
+          </p>
+        )}
 
         {/* Unsupported file feedback */}
         {showUnsupported && unsupportedFiles.length > 0 && (

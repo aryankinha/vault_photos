@@ -44,6 +44,7 @@ import { UploadContext } from './uploadContextValue'
 import { cryptoPool } from '../workers/cryptoWorkerPool'
 import { isAbortError } from '../utils/abort'
 import { createLockAbortError } from '../utils/vaultLock'
+import { enqueueSelectedFiles } from '../utils/uploadQueue'
 
 /**
  * @typedef {Object} BatchProgress
@@ -284,9 +285,7 @@ export function UploadProvider({ children }) {
    */
   const startBatch = useCallback(async (files) => {
     if (uploadRunningRef.current) {
-      if (retryQueueRef.current.length < RETRY_QUEUE_LIMIT) {
-        for (const file of files) retryQueueRef.current.push({ type: 'file', file })
-      }
+      enqueueSelectedFiles(retryQueueRef.current, files, RETRY_QUEUE_LIMIT)
       return
     }
     clearTimeout(progressTimerRef.current)
@@ -294,11 +293,7 @@ export function UploadProvider({ children }) {
     // Another start (e.g. the retry drain) may have claimed the slot while we
     // waited for cleanup — queue instead of racing/dropping.
     if (uploadRunningRef.current) {
-      for (const file of files) {
-        if (retryQueueRef.current.length < RETRY_QUEUE_LIMIT) {
-          retryQueueRef.current.push({ type: 'file', file })
-        }
-      }
+      enqueueSelectedFiles(retryQueueRef.current, files, RETRY_QUEUE_LIMIT)
       return
     }
     await runUploadSlot(async (controller, generation) => {
