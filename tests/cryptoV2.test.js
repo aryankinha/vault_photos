@@ -72,6 +72,8 @@ test('Crockford key text round trips all bytes, aliases and grouping, with check
   }
   assert.throws(() => decodeSecret(vault.secretKeyText, 'recovery'))
   assert.throws(() => decodeSecret(`${vault.secretKeyText}extra`, 'secret'))
+  assert.throws(() => decodeSecret(`SK2-${'0'.repeat(51)}1-1`, 'secret'), /Invalid key text/)
+  assert.throws(() => decodeSecret(`SK2-${'0'.repeat(24)}!${'0'.repeat(27)}-0`, 'secret'), /Invalid key text/)
 })
 
 test('raw key import consumes input and produces non-extractable device/recovery keys', async () => {

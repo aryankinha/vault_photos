@@ -39,23 +39,25 @@ export function decodeSecret(text, kind) {
   let bits = 0
   let offset = 0
   let check = 0
-  for (const symbol of encoded.slice(0, -1)) {
-    const value = ALPHABET.indexOf(symbol)
-    if (value < 0) throw new Error('Invalid key text')
-    check = (check * 32 + value) % 37
-    buffer = (buffer << 5) | value
-    bits += 5
-    if (bits >= 8) {
-      bits -= 8
-      raw[offset++] = (buffer >>> bits) & 255
+  try {
+    for (const symbol of encoded.slice(0, -1)) {
+      const value = ALPHABET.indexOf(symbol)
+      if (value < 0) throw new Error('Invalid key text')
+      check = (check * 32 + value) % 37
+      buffer = (buffer << 5) | value
+      bits += 5
+      if (bits >= 8) {
+        bits -= 8
+        raw[offset++] = (buffer >>> bits) & 255
+      }
+      buffer &= (1 << bits) - 1
     }
-    buffer &= (1 << bits) - 1
-  }
-  if (offset !== 32 || buffer !== 0 || CHECK_ALPHABET[check] !== encoded.at(-1)) {
+    if (offset !== 32 || buffer !== 0 || CHECK_ALPHABET[check] !== encoded.at(-1)) throw new Error('Invalid key text')
+    return raw
+  } catch (error) {
     raw.fill(0)
-    throw new Error('Invalid key text')
+    throw error
   }
-  return raw
 }
 
 /** Consume a raw SK buffer; the caller must not use it after this operation. */
