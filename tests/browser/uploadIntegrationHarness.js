@@ -40,6 +40,9 @@ function base64ToBytes(base64) {
 window.runUploadIntegration = async () => {
   const originalFetch = window.fetch
   const OriginalXHR = window.XMLHttpRequest
+  const largeVideo = location.search.includes('large')
+    ? await (await originalFetch('/test-fixtures.local/large.mp4')).blob()
+    : null
   const before = new Set((await getUploadQueue()).map((row) => row.id))
   const ids = new Set()
   const key = await unlockWithPassphrase('integration test only passphrase', crypto.getRandomValues(new Uint8Array(16)))
@@ -102,10 +105,22 @@ window.runUploadIntegration = async () => {
     if (photoResult.entries.length !== 1) throw new Error('Expected one committed photo entry')
 
     // 2) Chunked video (real recorded webm): context-bound chunks + chunk_sha256.
-    const video = new File([await recordTinyVideo()], 'integration.webm', { type: 'video/webm' })
-    const videoResult = await uploadMediaBatch([video])
+    const videoName = largeVideo ? 'integration.mp4' : 'integration.webm'
+    const video = new File([largeVideo || await recordTinyVideo()], videoName, { type: largeVideo ? 'video/mp4' : 'video/webm' })
+    // Cross the 10-file processing window so preparation of the next window
+    // cannot reset bytes/counts already reported for the previous one.
+    const extras = Array.from({ length: 11 }, (_, index) => new File([blob], `extra-${index}.jpg`, { type: 'image/jpeg' }))
+    const progress = []
+    const videoResult = await uploadMediaBatch([video, ...extras], (event) => {
+      progress.push({ percent: event.overallPercent, completed: event.completedFiles })
+    })
     if (videoResult.errors.length) throw videoResult.errors[0].error
-    if (videoResult.entries.length !== 1) throw new Error('Expected one committed video entry')
+    if (videoResult.entries.length !== 12) throw new Error('Expected all twelve mixed-batch entries')
+    for (let index = 1; index < progress.length; index += 1) {
+      if (progress[index].percent < progress[index - 1].percent || progress[index].completed < progress[index - 1].completed) {
+        throw new Error('Aggregate upload progress regressed during a mixed batch')
+      }
+    }
 
     const latestManifest = manifestBytes
     manifestBytes = base64ToBytes(commits[0].manifestBytesBase64).buffer
@@ -130,8 +145,8 @@ window.runUploadIntegration = async () => {
     const videoManifest = await parseManifestBytes(new Uint8Array(
       await decryptPacked(base64ToBytes(commits[1].manifestBytesBase64), key),
     ))
-    const videoEntry = videoManifest.files.find((entry) => entry.name === 'integration.webm')
-    if (videoManifest.files.length !== 2 || videoManifest.revision !== 2) throw new Error('Sequential uploads must preserve both entries and advance revisions')
+    const videoEntry = videoManifest.files.find((entry) => entry.name === videoName)
+    if (videoManifest.files.length !== 13 || videoManifest.revision !== 2) throw new Error('Mixed uploads must preserve all entries and advance revisions')
     if (!videoEntry) throw new Error('Video entry missing from published manifest')
     if (videoEntry.crypto_version !== 2 || videoEntry.chunked !== true) {
       throw new Error('Video entry is not a context-bound chunked entry')
@@ -149,8 +164,10 @@ window.runUploadIntegration = async () => {
       passed: true,
       rollbackRejected,
       commits: commits.length,
+      mixedBatchEntries: videoResult.entries.length,
+      monotonicProgress: true,
       photo: { cryptoVersion: photoEntry.crypto_version, sha256: photoEntry.sha256.slice(0, 12) },
-      video: { cryptoVersion: videoEntry.crypto_version, chunks: videoEntry.chunk_count },
+      video: { cryptoVersion: videoEntry.crypto_version, chunks: videoEntry.chunk_count, bytes: video.size },
       parentCommit: commits[0].parentCommit,
     }
   } finally {

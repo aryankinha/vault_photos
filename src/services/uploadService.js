@@ -106,7 +106,7 @@ export async function uploadMediaBatch(
   const sourceFiles = Array.from(files || [])
   const errors = []
   const totalFiles = sourceFiles.length
-  const report = (update) => onBatchProgress?.({
+  let progressSnapshot = {
     totalFiles,
     completedFiles: 0,
     currentFile: '',
@@ -114,8 +114,17 @@ export async function uploadMediaBatch(
     overallPercent: 0,
     etaDisplay: 'calculating...',
     errors,
-    ...update,
-  })
+  }
+  const report = (update) => {
+    progressSnapshot = {
+      ...progressSnapshot,
+      ...update,
+      // Retries may restart a transfer; keep the displayed batch high-water
+      // mark while the stage communicates waiting/retry/finalization.
+      overallPercent: Math.max(progressSnapshot.overallPercent, update.overallPercent ?? 0),
+    }
+    onBatchProgress?.(progressSnapshot)
+  }
 
   if (totalFiles === 0) return { entries: [], errors, needsSource: [] }
   throwIfAborted(signal)
@@ -747,7 +756,7 @@ async function uploadChunkIndexes(item, file, indexes, chunkHashes, callbacks, s
         )
         throwIfAborted(chunkController.signal)
         const sha256 = await sha256Hex(chunk.encrypted)
-        callbacks.onState?.('uploading', 0)
+        callbacks.onState?.('uploading', (uploadedBytes + inflightBytes) / (file.size + item.chunkCount * CHUNK_WIRE_OVERHEAD))
 
         const response = await withNetworkRecovery(
           () => {
@@ -764,10 +773,11 @@ async function uploadChunkIndexes(item, file, indexes, chunkHashes, callbacks, s
               },
               false,
               { signal: chunkController.signal, sha256 },
-            ).finally(() => {
+            ).catch((error) => {
               inflightBytes -= inflight.get(chunk.index) ?? 0
               inflight.delete(chunk.index)
               report()
+              throw error
             })
           },
           () => callbacks.onWaiting?.(),
@@ -776,9 +786,13 @@ async function uploadChunkIndexes(item, file, indexes, chunkHashes, callbacks, s
 
         const descriptor = parseUploadResponse(response, item.id)
         const receipt = { ...descriptor, index: chunk.index }
-        await callbacks.onChunkDone?.(chunk.index, receipt)
+        // Exchange in-flight bytes for confirmed bytes in one synchronous
+        // step. Removing them in `finally` caused a visible dip on every chunk.
+        inflightBytes -= inflight.get(chunk.index) ?? 0
+        inflight.delete(chunk.index)
         uploadedBytes += chunk.encrypted.byteLength
         report()
+        await callbacks.onChunkDone?.(chunk.index, receipt)
       },
       chunkController.signal,
     )
